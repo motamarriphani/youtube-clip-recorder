@@ -111,7 +111,16 @@ function handleRecordingStop() {
 
         const url = URL.createObjectURL(blob);
 
-        console.log(`Background: Triggering download for ${filename}`);
+        // --- ADD THESE LOGS ---
+        console.log("Background: Attempting download with:");
+        console.log(" - Filename:", filename);
+        console.log(" - Blob Size:", blob.size);
+        console.log(" - Blob Type:", blob.type);
+        console.log(" - Object URL:", url);
+        // --- END OF ADDED LOGS ---
+
+
+        console.log(`Background: Triggering download for ${filename}`); // Original log
         chrome.downloads.download({
             url: url,
             filename: filename,
@@ -122,7 +131,10 @@ function handleRecordingStop() {
             // Browser usually handles cleanup, but for long-running extensions, management might be needed.
             // setTimeout(() => URL.revokeObjectURL(url), 60000); // Revoke after 1 min as fallback
         }).catch(error => {
-            console.error("Background: Download failed:", error);
+            // --- ALSO LOG THE ERROR OBJECT ---
+            console.error("Background: Download failed error object:", error);
+            console.error("Background: Download failed:", error.message); // Keep original log too
+            // --- END ---
             URL.revokeObjectURL(url); // Clean up if download initiation failed
         });
 
