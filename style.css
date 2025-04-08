@@ -1,0 +1,18 @@
+#yt-clip-recorder-button {
+    /* Inherits .ytp-button styles if injection works */
+    /* Add overrides or specific styles here if needed */
+    margin-left: 8px !important; /* Ensure spacing */
+    font-size: 0.9em !important;
+    padding: 5px 8px !important;
+    line-height: normal; /* Ensure text fits */
+    /* Add a subtle border or background on hover? */
+}
+
+#yt-clip-recorder-button:hover {
+  /* background-color: rgba(255, 255, 255, 0.2); */
+}
+
+/* Style when recording */
+#yt-clip-recorder-button[style*="color: red"] {
+    font-weight: bold;
+}
