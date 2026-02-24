@@ -3,12 +3,69 @@ console.log("YouTube Clip Recorder: Content script loaded.");
 let recordButton = null;
 let isRecording = false;
 let stopTimeoutId = null; // Timer to auto-stop recording
+let domObserver = null;
+let urlCheckObserver = null;
+let lastUrl = location.href;
+let lastIsWatchPage = false;
+let reinjectDebounceId = null;
+
 const MAX_RECORD_DURATION_MS = 10000; // 10 seconds
+const REINJECT_DEBOUNCE_MS = 150;
+
+function isWatchPageUrl(url = location.href) {
+    try {
+        const parsed = new URL(url);
+        return parsed.pathname === '/watch';
+    } catch (_) {
+        return url.includes('/watch');
+    }
+}
+
+function resetRecordingUiState() {
+    isRecording = false;
+
+    if (recordButton) {
+        recordButton.textContent = 'REC Clip';
+        recordButton.style.color = '';
+    }
+
+    if (stopTimeoutId) {
+        clearTimeout(stopTimeoutId);
+        stopTimeoutId = null;
+    }
+}
+
+function stopRecordingIfActive(reason = '') {
+    if (!isRecording) return;
+
+    console.log(`YouTube Clip Recorder: ${reason || 'Stopping active recording.'}`);
+    chrome.runtime.sendMessage({ action: 'stopRecording' }).catch((e) => {
+        console.log('YouTube Clip Recorder: Error sending stop message:', e);
+    });
+
+    resetRecordingUiState();
+}
+
+function cleanupButton() {
+    const existingButton = document.getElementById('yt-clip-recorder-button');
+    if (existingButton) {
+        existingButton.remove();
+    }
+
+    if (recordButton === existingButton) {
+        recordButton = null;
+    }
+}
 
 function createRecordButton() {
-    if (document.getElementById('yt-clip-recorder-button')) {
-        // Button already exists, potentially from a previous SPA navigation
-        return document.getElementById('yt-clip-recorder-button');
+    const existingButton = document.getElementById('yt-clip-recorder-button');
+    if (existingButton) {
+        return existingButton;
+    }
+
+    const controlsRight = document.querySelector('.ytp-right-controls');
+    if (!controlsRight) {
+        return null;
     }
 
     const button = document.createElement('button');
@@ -21,30 +78,17 @@ function createRecordButton() {
 
     button.onclick = handleRecordButtonClick;
 
-    // Try to inject the button into YouTube's control bar
-    // This selector might change with YouTube updates!
-    const controlsRight = document.querySelector('.ytp-right-controls');
-    if (controlsRight) {
-        // Insert it before the settings button for visibility
-        const settingsButton = controlsRight.querySelector('.ytp-settings-button');
-        if (settingsButton) {
-            controlsRight.insertBefore(button, settingsButton);
-        } else {
-             // Fallback: append to the end of right controls
-             controlsRight.appendChild(button);
-        }
-        console.log("YouTube Clip Recorder: Button injected.");
-        return button;
+    // Insert it before the settings button for visibility
+    const settingsButton = controlsRight.querySelector('.ytp-settings-button');
+    if (settingsButton) {
+        controlsRight.insertBefore(button, settingsButton);
     } else {
-        console.warn("YouTube Clip Recorder: Could not find YouTube controls container.");
-        // Fallback: Append to body (less ideal)
-        // button.style.position = 'fixed';
-        // button.style.bottom = '20px';
-        // button.style.right = '20px';
-        // button.style.zIndex = '9999';
-        // document.body.appendChild(button);
-        return null; // Indicate failure to inject properly
+        // Fallback: append to the end of right controls
+        controlsRight.appendChild(button);
     }
+
+    console.log('YouTube Clip Recorder: Button injected.');
+    return button;
 }
 
 async function handleRecordButtonClick() {
@@ -52,8 +96,8 @@ async function handleRecordButtonClick() {
 
     const videoElement = document.querySelector('video.html5-main-video');
     if (!videoElement) {
-        console.error("YouTube Clip Recorder: Video element not found.");
-        alert("Could not find the YouTube video element.");
+        console.error('YouTube Clip Recorder: Video element not found.');
+        alert('Could not find the YouTube video element.');
         return;
     }
 
@@ -70,105 +114,151 @@ async function handleRecordButtonClick() {
         try {
             // Send message to background script to start
             await chrome.runtime.sendMessage({
-                action: "startRecording",
+                action: 'startRecording',
                 payload: { title: videoTitle, timestamp: timestamp }
             });
-            console.log("YouTube Clip Recorder: Start recording message sent.");
+            console.log('YouTube Clip Recorder: Start recording message sent.');
 
             // Set timeout for automatic stop
             stopTimeoutId = setTimeout(() => {
-                console.log("YouTube Clip Recorder: Max duration reached, stopping automatically.");
+                console.log('YouTube Clip Recorder: Max duration reached, stopping automatically.');
                 handleRecordButtonClick(); // Call this function again to trigger the stop logic
             }, MAX_RECORD_DURATION_MS);
-
         } catch (error) {
-            console.error("YouTube Clip Recorder: Error starting recording.", error);
+            console.error('YouTube Clip Recorder: Error starting recording.', error);
             alert(`Error starting recording: ${error.message}`);
-            // Reset UI if start failed
-            isRecording = false;
-            recordButton.textContent = 'REC Clip';
-            recordButton.style.color = ''; // Reset color
-            clearTimeout(stopTimeoutId);
-            stopTimeoutId = null;
+            resetRecordingUiState();
         }
-
     } else {
         // --- Stop Recording ---
-        isRecording = false;
-        recordButton.textContent = 'REC Clip'; // Reset text immediately
-        recordButton.style.color = ''; // Reset color
-
-        // Clear the automatic stop timer
-        if (stopTimeoutId) {
-            clearTimeout(stopTimeoutId);
-            stopTimeoutId = null;
-        }
+        resetRecordingUiState();
 
         try {
             // Send message to background script to stop
-            await chrome.runtime.sendMessage({ action: "stopRecording" });
-            console.log("YouTube Clip Recorder: Stop recording message sent.");
+            await chrome.runtime.sendMessage({ action: 'stopRecording' });
+            console.log('YouTube Clip Recorder: Stop recording message sent.');
             // Optional: Maybe disable button briefly while saving?
             recordButton.disabled = true;
-            setTimeout(() => { recordButton.disabled = false; }, 1000); // Re-enable after a short delay
-
+            setTimeout(() => {
+                recordButton.disabled = false;
+            }, 1000); // Re-enable after a short delay
         } catch (error) {
-            console.error("YouTube Clip Recorder: Error stopping recording.", error);
+            console.error('YouTube Clip Recorder: Error stopping recording.', error);
             alert(`Error stopping recording: ${error.message}`);
-            // UI is already reset, maybe just log error
         }
     }
 }
-
-// --- Initialization and Handling YouTube's Dynamic Loading ---
 
 function initialize() {
-    // Check if button already exists (maybe from navigating back/forth)
-    if (!document.getElementById('yt-clip-recorder-button')) {
-        recordButton = createRecordButton();
-        isRecording = false; // Ensure state is reset on init
-    } else {
-         recordButton = document.getElementById('yt-clip-recorder-button');
-         // Make sure state reflects reality if user navigated away while recording was pending
-         // (A more robust solution might query background script for state)
-         if (recordButton.textContent !== 'REC Clip') {
-             recordButton.textContent = 'REC Clip';
-             recordButton.style.color = '';
-             isRecording = false;
-         }
+    if (!isWatchPageUrl()) {
+        return;
+    }
+
+    const button = createRecordButton();
+    if (button) {
+        recordButton = button;
+
+        // Ensure state is reset on init
+        if (recordButton.textContent !== 'REC Clip') {
+            resetRecordingUiState();
+        }
     }
 }
 
-// Observe for changes in the DOM, specifically targeting the player area or URL changes
-// YouTube navigation often updates the DOM without a full page load.
-
-// Simple approach: Use setInterval to check if the button needs to be added
-// This isn't the most efficient, but easier than complex MutationObservers for now
-const checkInterval = setInterval(() => {
-    // Check if we are on a watch page and if the button's parent exists
-    if (window.location.href.includes("/watch") && document.querySelector('.ytp-right-controls')) {
-        initialize();
-    } else {
-        // If we navigated away from a watch page, ensure recording stops if it was active
-        // (This check might be redundant if background handles tab closure/update, but good for safety)
-        if (isRecording) {
-           console.log("YouTube Clip Recorder: Navigated away, attempting to stop recording if active.");
-           chrome.runtime.sendMessage({ action: "stopRecording" }).catch(e => console.log("Error sending stop on navigate away:", e));
-           isRecording = false;
-           if(recordButton) {
-               recordButton.textContent = 'REC Clip';
-               recordButton.style.color = '';
-           }
-           if(stopTimeoutId) clearTimeout(stopTimeoutId);
-        }
-        // Remove button if it exists but we are not on a watch page anymore
-        const existingButton = document.getElementById('yt-clip-recorder-button');
-        if (existingButton) {
-            existingButton.remove();
-            recordButton = null;
-        }
+function debouncedInitialize() {
+    if (reinjectDebounceId) {
+        clearTimeout(reinjectDebounceId);
     }
-}, 1000); // Check every second
 
-// Initial attempt to add the button
-initialize();
+    reinjectDebounceId = setTimeout(() => {
+        reinjectDebounceId = null;
+        initialize();
+    }, REINJECT_DEBOUNCE_MS);
+}
+
+function handleRouteOrStateChange() {
+    const currentUrl = location.href;
+    const currentIsWatchPage = isWatchPageUrl(currentUrl);
+    const watchStateChanged = currentIsWatchPage !== lastIsWatchPage;
+    const urlChanged = currentUrl !== lastUrl;
+
+    if (!urlChanged && !watchStateChanged) {
+        return;
+    }
+
+    lastUrl = currentUrl;
+    lastIsWatchPage = currentIsWatchPage;
+
+    if (currentIsWatchPage) {
+        debouncedInitialize();
+        return;
+    }
+
+    stopRecordingIfActive('Navigated away from watch page, stopping recording if active.');
+    cleanupButton();
+}
+
+function startDomObservation() {
+    if (domObserver) {
+        domObserver.disconnect();
+    }
+
+    const target = document.querySelector('#movie_player, ytd-player, ytd-watch-flexy') || document.body;
+    domObserver = new MutationObserver(() => {
+        if (!isWatchPageUrl()) return;
+
+        // Only attempt re-injection when control container changes/appears
+        if (!document.getElementById('yt-clip-recorder-button') || document.querySelector('.ytp-right-controls')) {
+            debouncedInitialize();
+        }
+    });
+
+    domObserver.observe(target, {
+        childList: true,
+        subtree: true
+    });
+}
+
+function startUrlObservation() {
+    if (urlCheckObserver) {
+        urlCheckObserver.disconnect();
+    }
+
+    // Observe title/document mutations as lightweight triggers for SPA route changes.
+    urlCheckObserver = new MutationObserver(handleRouteOrStateChange);
+    urlCheckObserver.observe(document.documentElement, {
+        childList: true,
+        subtree: true
+    });
+
+    // Catch history-based and back/forward navigations.
+    window.addEventListener('popstate', handleRouteOrStateChange);
+    window.addEventListener('yt-navigate-finish', handleRouteOrStateChange);
+
+    const originalPushState = history.pushState;
+    const originalReplaceState = history.replaceState;
+
+    history.pushState = function (...args) {
+        const result = originalPushState.apply(this, args);
+        handleRouteOrStateChange();
+        return result;
+    };
+
+    history.replaceState = function (...args) {
+        const result = originalReplaceState.apply(this, args);
+        handleRouteOrStateChange();
+        return result;
+    };
+}
+
+function bootstrap() {
+    lastUrl = location.href;
+    lastIsWatchPage = isWatchPageUrl(lastUrl);
+
+    startDomObservation();
+    startUrlObservation();
+    handleRouteOrStateChange();
+    debouncedInitialize();
+}
+
+bootstrap();
