@@ -1,9 +1,10 @@
 console.log("YouTube Clip Recorder: Content script loaded.");
 
 let recordButton = null;
+let audioToggle = null;
 let isRecording = false;
 let isTransitioning = false;
-let stopTimeoutId = null; // Timer to auto-stop recording
+let stopTimeoutId = null;
 let reenableTimeoutId = null;
 let domObserver = null;
 let urlCheckObserver = null;
@@ -11,10 +12,11 @@ let lastUrl = location.href;
 let lastIsWatchPage = false;
 let reinjectDebounceId = null;
 
-const DEFAULT_MAX_RECORD_DURATION_MS = 10000; // 10 seconds fallback
+const DEFAULT_MAX_RECORD_DURATION_MS = 10000;
 const MIN_RECORD_DURATION_SECONDS = 3;
 const MAX_RECORD_DURATION_SECONDS = 60;
 const STORAGE_KEY_MAX_DURATION_SECONDS = 'maxRecordDurationSeconds';
+const AUDIO_PREF_KEY = 'includeTabAudio';
 const REINJECT_DEBOUNCE_MS = 150;
 
 const RECORDING_STARTED_EVENT = "recordingStarted";
@@ -32,11 +34,9 @@ function isWatchPageUrl(url = location.href) {
 
 function clampDurationSeconds(value) {
     const seconds = Number.parseInt(value, 10);
-
     if (Number.isNaN(seconds)) {
         return DEFAULT_MAX_RECORD_DURATION_MS / 1000;
     }
-
     return Math.min(MAX_RECORD_DURATION_SECONDS, Math.max(MIN_RECORD_DURATION_SECONDS, seconds));
 }
 
@@ -48,6 +48,15 @@ async function getMaxRecordDurationMs() {
     } catch (error) {
         console.warn("YouTube Clip Recorder: Failed to load duration from storage, using default.", error);
         return DEFAULT_MAX_RECORD_DURATION_MS;
+    }
+}
+
+async function getIncludeAudioPreference() {
+    try {
+        const stored = await chrome.storage.local.get({ [AUDIO_PREF_KEY]: false });
+        return Boolean(stored[AUDIO_PREF_KEY]);
+    } catch (error) {
+        return false;
     }
 }
 
@@ -100,7 +109,6 @@ async function requestStopRecording() {
     try {
         await chrome.runtime.sendMessage({ action: "stopRecording" });
         console.log("YouTube Clip Recorder: Stop recording message sent.");
-        // If background doesn't answer with state event for any reason, recover UI quickly.
         reenableTimeoutId = setTimeout(() => {
             if (!isRecording) {
                 resetUIState();
@@ -111,6 +119,39 @@ async function requestStopRecording() {
         alert(`Error stopping recording: ${error.message}`);
         resetUIState();
     }
+}
+
+function createAudioToggle() {
+    if (document.getElementById('yt-clip-recorder-audio-toggle')) {
+        return document.getElementById('yt-clip-recorder-audio-toggle');
+    }
+
+    const label = document.createElement('label');
+    label.id = 'yt-clip-recorder-audio-toggle';
+    label.className = 'yt-clip-recorder-audio-toggle ytp-button';
+    label.style.marginLeft = '8px';
+    label.style.fontSize = '0.9em';
+    label.style.padding = '5px 8px';
+    label.style.display = 'inline-flex';
+    label.style.alignItems = 'center';
+    label.style.gap = '4px';
+
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.id = 'yt-clip-recorder-audio-checkbox';
+    checkbox.title = 'Include tab audio in recording';
+
+    const text = document.createElement('span');
+    text.textContent = 'Audio';
+
+    checkbox.addEventListener('change', async () => {
+        await chrome.storage.local.set({ [AUDIO_PREF_KEY]: checkbox.checked });
+    });
+
+    label.appendChild(checkbox);
+    label.appendChild(text);
+
+    return label;
 }
 
 function createRecordButton() {
@@ -131,19 +172,21 @@ function createRecordButton() {
     button.style.marginLeft = '8px';
     button.style.fontSize = '0.9em';
     button.style.padding = '5px 8px';
-
     button.onclick = handleRecordButtonClick;
 
-    // Insert it before the settings button for visibility
+    const toggle = createAudioToggle();
+
     const settingsButton = controlsRight.querySelector('.ytp-settings-button');
     if (settingsButton) {
+        controlsRight.insertBefore(toggle, settingsButton);
         controlsRight.insertBefore(button, settingsButton);
     } else {
-        // Fallback: append to the end of right controls
+        controlsRight.appendChild(toggle);
         controlsRight.appendChild(button);
     }
+    audioToggle = toggle;
 
-    console.log('YouTube Clip Recorder: Button injected.');
+    console.log('YouTube Clip Recorder: Button and audio toggle injected.');
     return button;
 }
 
@@ -158,18 +201,18 @@ async function handleRecordButtonClick() {
     }
 
     if (!isRecording) {
-        // --- Start Recording ---
         isTransitioning = true;
         setButtonState({ text: 'Starting...', color: '', disabled: true });
 
         const videoTitle = document.title.replace(/ - YouTube$/, '');
         const currentTimeSeconds = Math.floor(videoElement.currentTime);
         const timestamp = new Date(currentTimeSeconds * 1000).toISOString().substr(14, 5);
+        const includeAudio = Boolean(audioToggle?.querySelector('input')?.checked);
 
         try {
             const response = await chrome.runtime.sendMessage({
                 action: "startRecording",
-                payload: { title: videoTitle, timestamp: timestamp }
+                payload: { title: videoTitle, timestamp: timestamp, includeAudio }
             });
 
             if (!response?.success) {
@@ -184,7 +227,6 @@ async function handleRecordButtonClick() {
             resetUIState();
         }
     } else {
-        // --- Stop Recording ---
         await requestStopRecording();
     }
 }
@@ -206,7 +248,7 @@ chrome.runtime.onMessage.addListener((message) => {
     }
 });
 
-function initialize() {
+async function initialize() {
     if (!isWatchPageUrl()) {
         return;
     }
@@ -215,6 +257,16 @@ function initialize() {
     if (button) {
         recordButton = button;
         resetUIState();
+    }
+
+    if (!audioToggle) {
+        audioToggle = document.getElementById('yt-clip-recorder-audio-toggle');
+    }
+
+    const includeAudio = await getIncludeAudioPreference();
+    const checkbox = audioToggle?.querySelector('input');
+    if (checkbox) {
+        checkbox.checked = includeAudio;
     }
 }
 
@@ -247,20 +299,21 @@ function handleRouteOrStateChange() {
         return;
     }
 
-    // Navigated away from watch page
     if (isRecording) {
         console.log("YouTube Clip Recorder: Navigated away, stopping recording.");
         chrome.runtime.sendMessage({ action: "stopRecording" }).catch(e => console.log("Error sending stop on navigate away:", e));
         resetUIState();
     }
 
-    // Remove button if it exists
     const existingButton = document.getElementById('yt-clip-recorder-button');
+    const existingToggle = document.getElementById('yt-clip-recorder-audio-toggle');
     if (existingButton) {
         existingButton.remove();
-        if (recordButton === existingButton) {
-            recordButton = null;
-        }
+        recordButton = null;
+    }
+    if (existingToggle) {
+        existingToggle.remove();
+        audioToggle = null;
     }
 }
 
@@ -273,7 +326,6 @@ function startDomObservation() {
     domObserver = new MutationObserver(() => {
         if (!isWatchPageUrl()) return;
 
-        // Only attempt re-injection when control container changes/appears
         if (!document.getElementById('yt-clip-recorder-button') || document.querySelector('.ytp-right-controls')) {
             debouncedInitialize();
         }
@@ -290,14 +342,12 @@ function startUrlObservation() {
         urlCheckObserver.disconnect();
     }
 
-    // Observe title/document mutations as lightweight triggers for SPA route changes
     urlCheckObserver = new MutationObserver(handleRouteOrStateChange);
     urlCheckObserver.observe(document.documentElement, {
         childList: true,
         subtree: true
     });
 
-    // Catch history-based and back/forward navigations
     window.addEventListener('popstate', handleRouteOrStateChange);
     window.addEventListener('yt-navigate-finish', handleRouteOrStateChange);
 

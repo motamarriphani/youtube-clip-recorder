@@ -1,40 +1,41 @@
 let mediaStream = null;
 let mediaRecorder = null;
 let recordedBlobs = [];
-let captureInfo = { title: "youtube_clip", timestamp: "00:00" }; // Store title/time
-let selectedVideoMimeType = null;
+let captureInfo = { title: "youtube_clip", timestamp: "00:00", includeAudio: false };
+let currentMimeType = "video/webm";
+let currentFileExtension = "webm";
 
 const VIDEO_MIME_CANDIDATES = [
-    'video/webm;codecs=vp9',
-    'video/webm;codecs=vp8',
-    'video/webm',
+    { type: 'video/webm;codecs=vp9,opus', extension: 'webm' },
+    { type: 'video/webm;codecs=vp8,opus', extension: 'webm' },
+    { type: 'video/webm;codecs=vp9', extension: 'webm' },
+    { type: 'video/webm;codecs=vp8', extension: 'webm' },
+    { type: 'video/webm', extension: 'webm' },
+    { type: 'video/mp4;codecs=avc1.42E01E,mp4a.40.2', extension: 'mp4' },
+    { type: 'video/mp4', extension: 'mp4' },
 ];
+
 const RECORDING_STARTED_EVENT = "recordingStarted";
 const RECORDING_STOPPED_EVENT = "recordingStopped";
 const RECORDING_ERROR_EVENT = "recordingError";
 
-function selectSupportedMimeType() {
-    const supportedType = VIDEO_MIME_CANDIDATES.find((mimeType) => MediaRecorder.isTypeSupported(mimeType));
-    if (supportedType) {
-        console.log(`Background: Using recording MIME type: ${supportedType}`);
-        return supportedType;
+function selectSupportedMimeType(includeAudio) {
+    const compatibleType = VIDEO_MIME_CANDIDATES.find((candidate) => {
+        if (includeAudio && !candidate.type.includes('opus') && !candidate.type.includes('mp4a') && candidate.type.includes('codecs=')) {
+            return false;
+        }
+        return MediaRecorder.isTypeSupported(candidate.type);
+    });
+
+    if (compatibleType) {
+        return compatibleType;
     }
 
-    console.error(`Background: No supported MIME types found. Candidates: ${VIDEO_MIME_CANDIDATES.join(', ')}`);
-    return null;
-}
-
-function getExtensionFromMimeType(mimeType) {
-    if (mimeType && mimeType.includes('webm')) {
-        return 'webm';
-    }
-
-    return 'webm';
+    return { type: '', extension: 'webm' };
 }
 
 function emitRecordingState(type, payload = {}) {
     chrome.runtime.sendMessage({ type, payload }).catch((error) => {
-        // Ignore if there are no listeners in some extension contexts.
         console.debug(`Background: Unable to emit ${type}.`, error?.message || error);
     });
 }
@@ -44,43 +45,39 @@ function isRecordingActive() {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    // Use an async function here to allow 'await' and properly handle promises/sendResponse
     (async () => {
         if (message.action === "startRecording") {
             if (isRecordingActive()) {
                 console.warn("Background: Recording already in progress.");
                 sendResponse({ success: false, message: "Already recording." });
-                return; // Indicate message handled (implicitly)
+                return;
             }
 
             console.log("Background: Received startRecording", message.payload);
-            captureInfo = message.payload || captureInfo; // Store title/time
+            captureInfo = message.payload || captureInfo;
+            const includeAudio = Boolean(message.payload?.includeAudio);
 
             try {
-                // Important: Get the tab where the message came from
                 const targetTabId = sender.tab?.id;
                 if (!targetTabId) {
                     throw new Error("Could not get sender tab ID.");
                 }
 
-                // Start tab capture
                 mediaStream = await chrome.tabCapture.capture({
-                    audio: false, // No audio as requested
+                    audio: includeAudio,
                     video: true,
                     videoConstraints: {
                         mandatory: {
-                            // Request desired quality, browser will do its best
                             minWidth: 1280,
                             minHeight: 720,
                             maxWidth: 1920,
                             maxHeight: 1080,
-                            maxFrameRate: 30, // Capture at 30fps
+                            maxFrameRate: 30,
                         },
                     },
                 });
                 console.log("Background: Tab capture started.");
 
-                // Check if stream is valid
                 if (!mediaStream || mediaStream.getVideoTracks().length === 0) {
                     throw new Error("Failed to get video stream from tabCapture.");
                 }
@@ -97,21 +94,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     };
                 });
 
-                // Clear previous blobs
                 recordedBlobs = [];
 
-                selectedVideoMimeType = selectSupportedMimeType();
-                if (!selectedVideoMimeType) {
+                const selectedMime = selectSupportedMimeType(includeAudio);
+                currentMimeType = selectedMime.type || 'video/webm';
+                currentFileExtension = selectedMime.extension;
+
+                if (!selectedMime.type && !MediaRecorder.isTypeSupported('video/webm')) {
                     stopCaptureResources();
                     sendResponse({
                         success: false,
-                        message: "This browser/system does not support any compatible recording format (VP9/VP8/WebM). Please update your browser or try another device.",
+                        message: "This browser/system does not support any compatible recording format. Please update your browser or try another device.",
                     });
                     return;
                 }
 
-                // Create MediaRecorder
-                mediaRecorder = new MediaRecorder(mediaStream, { mimeType: selectedVideoMimeType });
+                const recorderOptions = selectedMime.type ? { mimeType: selectedMime.type } : undefined;
+                mediaRecorder = recorderOptions ? new MediaRecorder(mediaStream, recorderOptions) : new MediaRecorder(mediaStream);
 
                 mediaRecorder.ondataavailable = (event) => {
                     if (event.data && event.data.size > 0) {
@@ -120,26 +119,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     }
                 };
 
-                mediaRecorder.onstop = handleRecordingStop; // Assign the stop handler
+                mediaRecorder.onstop = handleRecordingStop;
 
                 mediaRecorder.onerror = (event) => {
                     const errorMessage = event.error?.message || "MediaRecorder error";
                     console.error("Background: MediaRecorder error:", event.error);
-                    // Clean up resources on error too
                     stopCaptureResources();
                     emitRecordingState(RECORDING_ERROR_EVENT, { message: errorMessage });
                     emitRecordingState(RECORDING_STOPPED_EVENT, { reason: "recorderError" });
                 };
 
-                // Start recording
-                mediaRecorder.start(100); // Collect data in chunks (e.g., every 100ms)
+                mediaRecorder.start(100);
                 console.log("Background: MediaRecorder started.");
                 emitRecordingState(RECORDING_STARTED_EVENT, { title: captureInfo.title, timestamp: captureInfo.timestamp });
-                sendResponse({ success: true }); // Signal success back to content script
+                sendResponse({ success: true });
 
             } catch (error) {
                 console.error("Background: Error starting tab capture or MediaRecorder:", error);
-                stopCaptureResources(); // Clean up if error occurs during setup
+                stopCaptureResources();
                 emitRecordingState(RECORDING_ERROR_EVENT, { message: error.message });
                 emitRecordingState(RECORDING_STOPPED_EVENT, { reason: "startFailed" });
                 sendResponse({ success: false, message: error.message });
@@ -148,35 +145,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         } else if (message.action === "stopRecording") {
             console.log("Background: Received stopRecording message.");
             if (isRecordingActive()) {
-                mediaRecorder.stop(); // This will trigger the 'onstop' event handler
-                // stopCaptureResources() is called within handleRecordingStop after blobs are processed
+                mediaRecorder.stop();
                 sendResponse({ success: true });
             } else {
                 console.warn("Background: Stop requested but recorder not active/found.");
-                // Still try to clean up just in case stream exists without recorder
                 stopCaptureResources();
                 emitRecordingState(RECORDING_STOPPED_EVENT, { reason: "alreadyInactive" });
                 sendResponse({ success: false, message: "Recorder not active." });
             }
         }
-    })(); // Immediately invoke the async function
+    })();
 
-    // Return true to indicate you wish to send a response asynchronously
     return true;
 });
 
 function handleRecordingStop() {
     console.log("Background: MediaRecorder stopped.");
     if (recordedBlobs && recordedBlobs.length > 0) {
-        const blobMimeType = selectedVideoMimeType || 'video/webm';
-        const blob = new Blob(recordedBlobs, { type: blobMimeType });
-        const extension = getExtensionFromMimeType(blobMimeType);
-        console.log(`Background: Finalizing blob with MIME type: ${blobMimeType}`);
+        const blob = new Blob(recordedBlobs, { type: currentMimeType });
 
-        // Sanitize filename
-        const safeTitle = captureInfo.title.replace(/[<>:"/\\|?*]+/g, '_').substring(0, 100); // Limit length too
+        const safeTitle = captureInfo.title.replace(/[<>:"/\\|?*]+/g, '_').substring(0, 100);
         const timestamp = captureInfo.timestamp || "00:00";
-        const filename = `${safeTitle}_clip_${timestamp}.${extension}`;
+        const audioSuffix = captureInfo.includeAudio ? '_with-audio' : '';
+        const filename = `${safeTitle}_clip_${timestamp}${audioSuffix}.${currentFileExtension}`;
 
         const url = URL.createObjectURL(blob);
 
@@ -184,32 +175,25 @@ function handleRecordingStop() {
         chrome.downloads.download({
             url: url,
             filename: filename,
-            // saveAs: true // Uncomment to prompt user for save location each time
         }).then(downloadId => {
             console.log(`Background: Download started with ID: ${downloadId}`);
-            // Note: Can't easily revokeObjectURL here directly as download is async.
-            // Browser usually handles cleanup, but for long-running extensions, management might be needed.
-            // setTimeout(() => URL.revokeObjectURL(url), 60000); // Revoke after 1 min as fallback
         }).catch(error => {
             console.error("Background: Download failed:", error);
-            URL.revokeObjectURL(url); // Clean up if download initiation failed
+            URL.revokeObjectURL(url);
             emitRecordingState(RECORDING_ERROR_EVENT, { message: error.message || "Download failed" });
         });
 
-        // Clear blobs after processing
         recordedBlobs = [];
     } else {
         console.warn("Background: Recording stopped but no data blobs found.");
     }
 
-    // Clean up stream/recorder resources AFTER processing blobs
     stopCaptureResources();
     emitRecordingState(RECORDING_STOPPED_EVENT, { reason: "stopped" });
 }
 
 function stopCaptureResources() {
     if (mediaRecorder && mediaRecorder.state !== "inactive") {
-        // If somehow stop wasn't called cleanly, try again.
         try {
             mediaRecorder.stop();
         } catch (e) {
@@ -222,7 +206,8 @@ function stopCaptureResources() {
     }
     mediaRecorder = null;
     mediaStream = null;
-    selectedVideoMimeType = null;
+    currentMimeType = "video/webm";
+    currentFileExtension = "webm";
     console.log("Background: Capture resources released.");
 }
 
