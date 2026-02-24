@@ -2,8 +2,71 @@ console.log("YouTube Clip Recorder: Content script loaded.");
 
 let recordButton = null;
 let isRecording = false;
+let isTransitioning = false;
 let stopTimeoutId = null; // Timer to auto-stop recording
+let reenableTimeoutId = null;
 const MAX_RECORD_DURATION_MS = 10000; // 10 seconds
+
+function clearTimers() {
+    if (stopTimeoutId) {
+        clearTimeout(stopTimeoutId);
+        stopTimeoutId = null;
+    }
+    if (reenableTimeoutId) {
+        clearTimeout(reenableTimeoutId);
+        reenableTimeoutId = null;
+    }
+}
+
+function setButtonState({ text, color = '', disabled = false }) {
+    if (!recordButton) return;
+    recordButton.textContent = text;
+    recordButton.style.color = color;
+    recordButton.disabled = disabled;
+}
+
+function resetUIState() {
+    isRecording = false;
+    isTransitioning = false;
+    clearTimers();
+    setButtonState({ text: 'REC Clip', color: '', disabled: false });
+}
+
+function applyRecordingState() {
+    isRecording = true;
+    isTransitioning = false;
+    setButtonState({ text: 'STOP ■', color: 'red', disabled: false });
+
+    clearTimeout(stopTimeoutId);
+    stopTimeoutId = setTimeout(() => {
+        console.log("YouTube Clip Recorder: Max duration reached, stopping automatically.");
+        requestStopRecording();
+    }, MAX_RECORD_DURATION_MS);
+}
+
+async function requestStopRecording() {
+    if (!recordButton || isTransitioning) {
+        return;
+    }
+
+    isTransitioning = true;
+    setButtonState({ text: 'Stopping...', color: '', disabled: true });
+
+    try {
+        await chrome.runtime.sendMessage({ action: "stopRecording" });
+        console.log("YouTube Clip Recorder: Stop recording message sent.");
+        // If background doesn't answer with state event for any reason, recover UI quickly.
+        reenableTimeoutId = setTimeout(() => {
+            if (!isRecording) {
+                resetUIState();
+            }
+        }, 1200);
+    } catch (error) {
+        console.error("YouTube Clip Recorder: Error stopping recording.", error);
+        alert(`Error stopping recording: ${error.message}`);
+        resetUIState();
+    }
+}
 
 function createRecordButton() {
     if (document.getElementById('yt-clip-recorder-button')) {
@@ -30,25 +93,19 @@ function createRecordButton() {
         if (settingsButton) {
             controlsRight.insertBefore(button, settingsButton);
         } else {
-             // Fallback: append to the end of right controls
-             controlsRight.appendChild(button);
+            // Fallback: append to the end of right controls
+            controlsRight.appendChild(button);
         }
         console.log("YouTube Clip Recorder: Button injected.");
         return button;
-    } else {
-        console.warn("YouTube Clip Recorder: Could not find YouTube controls container.");
-        // Fallback: Append to body (less ideal)
-        // button.style.position = 'fixed';
-        // button.style.bottom = '20px';
-        // button.style.right = '20px';
-        // button.style.zIndex = '9999';
-        // document.body.appendChild(button);
-        return null; // Indicate failure to inject properly
     }
+
+    console.warn("YouTube Clip Recorder: Could not find YouTube controls container.");
+    return null; // Indicate failure to inject properly
 }
 
 async function handleRecordButtonClick() {
-    if (!recordButton) return; // Safety check
+    if (!recordButton || isTransitioning) return; // Safety check
 
     const videoElement = document.querySelector('video.html5-main-video');
     if (!videoElement) {
@@ -59,72 +116,56 @@ async function handleRecordButtonClick() {
 
     if (!isRecording) {
         // --- Start Recording ---
-        isRecording = true;
-        recordButton.textContent = 'STOP ■'; // Indicate recording
-        recordButton.style.color = 'red'; // Visual feedback
+        isTransitioning = true;
+        setButtonState({ text: 'Starting...', color: '', disabled: true });
 
         const videoTitle = document.title.replace(/ - YouTube$/, ''); // Get clean title
         const currentTimeSeconds = Math.floor(videoElement.currentTime);
         const timestamp = new Date(currentTimeSeconds * 1000).toISOString().substr(14, 5); // Format as MM:SS
 
         try {
-            // Send message to background script to start
             const response = await chrome.runtime.sendMessage({
                 action: "startRecording",
                 payload: { title: videoTitle, timestamp: timestamp }
             });
-            if (!response?.success) {
-                throw new Error(response?.message || 'Failed to start recording.');
-            }
-            console.log("YouTube Clip Recorder: Start recording message sent.");
 
-            // Set timeout for automatic stop
-            stopTimeoutId = setTimeout(() => {
-                console.log("YouTube Clip Recorder: Max duration reached, stopping automatically.");
-                handleRecordButtonClick(); // Call this function again to trigger the stop logic
-            }, MAX_RECORD_DURATION_MS);
+            if (!response?.success) {
+                throw new Error(response?.message || "Failed to start recording.");
+            }
+
+            console.log("YouTube Clip Recorder: Start recording message sent.");
+            // Guard: only show STOP UI when the background confirms active recording.
+            // If the event message is dropped, fallback to a local state update.
+            applyRecordingState();
 
         } catch (error) {
             console.error("YouTube Clip Recorder: Error starting recording.", error);
             alert(`Error starting recording: ${error.message}`);
-            // Reset UI if start failed
-            isRecording = false;
-            recordButton.textContent = 'REC Clip';
-            recordButton.style.color = ''; // Reset color
-            clearTimeout(stopTimeoutId);
-            stopTimeoutId = null;
+            resetUIState();
         }
 
     } else {
         // --- Stop Recording ---
-        isRecording = false;
-        recordButton.textContent = 'REC Clip'; // Reset text immediately
-        recordButton.style.color = ''; // Reset color
-
-        // Clear the automatic stop timer
-        if (stopTimeoutId) {
-            clearTimeout(stopTimeoutId);
-            stopTimeoutId = null;
-        }
-
-        try {
-            // Send message to background script to stop
-            const response = await chrome.runtime.sendMessage({ action: "stopRecording" });
-            if (!response?.success) {
-                throw new Error(response?.message || 'Failed to stop recording.');
-            }
-            console.log("YouTube Clip Recorder: Stop recording message sent.");
-            // Optional: Maybe disable button briefly while saving?
-            recordButton.disabled = true;
-            setTimeout(() => { recordButton.disabled = false; }, 1000); // Re-enable after a short delay
-
-        } catch (error) {
-            console.error("YouTube Clip Recorder: Error stopping recording.", error);
-            alert(`Error stopping recording: ${error.message}`);
-            // UI is already reset, maybe just log error
-        }
+        await requestStopRecording();
     }
 }
+
+chrome.runtime.onMessage.addListener((message) => {
+    if (!message?.type) return;
+
+    if (message.type === 'recordingStarted') {
+        applyRecordingState();
+    }
+
+    if (message.type === 'recordingStopped') {
+        resetUIState();
+    }
+
+    if (message.type === 'recordingError') {
+        console.error('YouTube Clip Recorder: Background recording error.', message.payload?.message || message.payload);
+        resetUIState();
+    }
+});
 
 // --- Initialization and Handling YouTube's Dynamic Loading ---
 
@@ -132,16 +173,10 @@ function initialize() {
     // Check if button already exists (maybe from navigating back/forth)
     if (!document.getElementById('yt-clip-recorder-button')) {
         recordButton = createRecordButton();
-        isRecording = false; // Ensure state is reset on init
+        resetUIState();
     } else {
-         recordButton = document.getElementById('yt-clip-recorder-button');
-         // Make sure state reflects reality if user navigated away while recording was pending
-         // (A more robust solution might query background script for state)
-         if (recordButton.textContent !== 'REC Clip') {
-             recordButton.textContent = 'REC Clip';
-             recordButton.style.color = '';
-             isRecording = false;
-         }
+        recordButton = document.getElementById('yt-clip-recorder-button');
+        resetUIState();
     }
 }
 
@@ -156,17 +191,12 @@ const checkInterval = setInterval(() => {
         initialize();
     } else {
         // If we navigated away from a watch page, ensure recording stops if it was active
-        // (This check might be redundant if background handles tab closure/update, but good for safety)
-        if (isRecording) {
-           console.log("YouTube Clip Recorder: Navigated away, attempting to stop recording if active.");
-           chrome.runtime.sendMessage({ action: "stopRecording" }).catch(e => console.log("Error sending stop on navigate away:", e));
-           isRecording = false;
-           if(recordButton) {
-               recordButton.textContent = 'REC Clip';
-               recordButton.style.color = '';
-           }
-           if(stopTimeoutId) clearTimeout(stopTimeoutId);
+        if (isRecording || isTransitioning) {
+            console.log("YouTube Clip Recorder: Navigated away, attempting to stop recording if active.");
+            chrome.runtime.sendMessage({ action: "stopRecording" }).catch(e => console.log("Error sending stop on navigate away:", e));
+            resetUIState();
         }
+
         // Remove button if it exists but we are not on a watch page anymore
         const existingButton = document.getElementById('yt-clip-recorder-button');
         if (existingButton) {
