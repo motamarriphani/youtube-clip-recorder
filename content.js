@@ -11,7 +11,10 @@ let lastUrl = location.href;
 let lastIsWatchPage = false;
 let reinjectDebounceId = null;
 
-const MAX_RECORD_DURATION_MS = 10000; // 10 seconds
+const DEFAULT_MAX_RECORD_DURATION_MS = 10000; // 10 seconds fallback
+const MIN_RECORD_DURATION_SECONDS = 3;
+const MAX_RECORD_DURATION_SECONDS = 60;
+const STORAGE_KEY_MAX_DURATION_SECONDS = 'maxRecordDurationSeconds';
 const REINJECT_DEBOUNCE_MS = 150;
 
 const RECORDING_STARTED_EVENT = "recordingStarted";
@@ -24,6 +27,27 @@ function isWatchPageUrl(url = location.href) {
         return parsed.pathname === '/watch';
     } catch (_) {
         return url.includes('/watch');
+    }
+}
+
+function clampDurationSeconds(value) {
+    const seconds = Number.parseInt(value, 10);
+
+    if (Number.isNaN(seconds)) {
+        return DEFAULT_MAX_RECORD_DURATION_MS / 1000;
+    }
+
+    return Math.min(MAX_RECORD_DURATION_SECONDS, Math.max(MIN_RECORD_DURATION_SECONDS, seconds));
+}
+
+async function getMaxRecordDurationMs() {
+    try {
+        const settings = await chrome.storage.sync.get(STORAGE_KEY_MAX_DURATION_SECONDS);
+        const boundedSeconds = clampDurationSeconds(settings?.[STORAGE_KEY_MAX_DURATION_SECONDS]);
+        return boundedSeconds * 1000;
+    } catch (error) {
+        console.warn("YouTube Clip Recorder: Failed to load duration from storage, using default.", error);
+        return DEFAULT_MAX_RECORD_DURATION_MS;
     }
 }
 
@@ -52,16 +76,17 @@ function resetUIState() {
     setButtonState({ text: 'REC Clip', color: '', disabled: false });
 }
 
-function applyRecordingState() {
+async function applyRecordingState() {
     isRecording = true;
     isTransitioning = false;
     setButtonState({ text: 'STOP ■', color: 'red', disabled: false });
 
     clearTimeout(stopTimeoutId);
+    const maxDurationMs = await getMaxRecordDurationMs();
     stopTimeoutId = setTimeout(() => {
         console.log("YouTube Clip Recorder: Max duration reached, stopping automatically.");
         requestStopRecording();
-    }, MAX_RECORD_DURATION_MS);
+    }, maxDurationMs);
 }
 
 async function requestStopRecording() {
@@ -152,7 +177,7 @@ async function handleRecordButtonClick() {
             }
 
             console.log("YouTube Clip Recorder: Start recording message sent.");
-            applyRecordingState();
+            await applyRecordingState();
         } catch (error) {
             console.error("YouTube Clip Recorder: Error starting recording.", error);
             alert(`Error starting recording: ${error.message}`);
@@ -168,7 +193,7 @@ chrome.runtime.onMessage.addListener((message) => {
     if (!message?.type) return;
 
     if (message.type === RECORDING_STARTED_EVENT) {
-        applyRecordingState();
+        await applyRecordingState();
     }
 
     if (message.type === RECORDING_STOPPED_EVENT) {
