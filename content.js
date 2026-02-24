@@ -43,6 +43,28 @@ function clampDurationSeconds(value) {
     return Math.min(MAX_RECORD_DURATION_SECONDS, Math.max(MIN_RECORD_DURATION_SECONDS, seconds));
 }
 
+function formatClipTimestamp(totalSeconds) {
+    const safeSeconds = Math.max(0, Math.floor(totalSeconds));
+    const hours = Math.floor(safeSeconds / 3600);
+    const minutes = Math.floor((safeSeconds % 3600) / 60);
+    const seconds = safeSeconds % 60;
+
+    if (hours > 0) {
+        return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+    }
+
+    return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+function escapeHtml(value) {
+    return String(value || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
 async function getMaxRecordDurationMs() {
     try {
         const settings = await chrome.storage.sync.get(STORAGE_KEY_MAX_DURATION_SECONDS);
@@ -91,7 +113,7 @@ function resetUIState() {
 async function applyRecordingState() {
     isRecording = true;
     isTransitioning = false;
-    setButtonState({ text: 'STOP ■', color: 'red', disabled: false });
+    setButtonState({ text: 'STOP', color: 'red', disabled: false });
 
     clearTimeout(stopTimeoutId);
     const maxDurationMs = await getMaxRecordDurationMs();
@@ -209,7 +231,7 @@ async function handleRecordButtonClick() {
 
         const videoTitle = document.title.replace(/ - YouTube$/, '');
         const currentTimeSeconds = Math.floor(videoElement.currentTime);
-        const timestamp = new Date(currentTimeSeconds * 1000).toISOString().substr(14, 5);
+        const timestamp = formatClipTimestamp(currentTimeSeconds);
         const includeAudio = Boolean(audioToggle?.querySelector('input')?.checked);
 
         try {
@@ -242,13 +264,13 @@ function showPreviewModal({ clipId, url, filename }) {
     overlay.id = 'yt-clip-preview-overlay';
     overlay.innerHTML = `
         <div class="yt-clip-preview-modal" role="dialog" aria-label="Clip preview">
-            <button class="yt-clip-preview-close" aria-label="Close preview">✕</button>
+            <button class="yt-clip-preview-close" aria-label="Close preview">x</button>
             <h3>Preview Clip</h3>
-            <video controls src="${url}"></video>
-            <p class="yt-clip-preview-filename">${filename}</p>
+            <video controls src="${escapeHtml(url)}"></video>
+            <p class="yt-clip-preview-filename">${escapeHtml(filename)}</p>
             <div class="yt-clip-preview-actions">
                 <button class="yt-clip-btn yt-clip-save">Save</button>
-                <button class="yt-clip-btn yt-clip-save-as">Save As…</button>
+                <button class="yt-clip-btn yt-clip-save-as">Save As...</button>
                 <button class="yt-clip-btn yt-clip-discard">Discard</button>
             </div>
         </div>
@@ -332,12 +354,7 @@ chrome.runtime.onMessage.addListener((message) => {
 });
 
 window.addEventListener('beforeunload', cleanupPreviewOnUnload);
-
-document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') {
-        cleanupPreviewOnUnload();
-    }
-});
+window.addEventListener('pagehide', cleanupPreviewOnUnload);
 
 async function initialize() {
     if (!isWatchPageUrl()) {
@@ -407,6 +424,7 @@ function handleRouteOrStateChange() {
         audioToggle = null;
     }
 
+    cleanupPreviewOnUnload();
     discardPreviewLocally();
 }
 
