@@ -1,0 +1,45 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>YouTube Clip Recorder Settings</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 12px;
+      min-width: 220px;
+    }
+
+    label,
+    select,
+    button {
+      display: block;
+      width: 100%;
+      margin-bottom: 8px;
+    }
+
+    #status {
+      font-size: 12px;
+      min-height: 16px;
+      color: #1a7f37;
+    }
+  </style>
+</head>
+<body>
+  <label for="duration">Max recording duration</label>
+  <select id="duration">
+    <option value="3">3 seconds</option>
+    <option value="5">5 seconds</option>
+    <option value="10">10 seconds</option>
+    <option value="15">15 seconds</option>
+    <option value="20">20 seconds</option>
+    <option value="30">30 seconds</option>
+    <option value="45">45 seconds</option>
+    <option value="60">60 seconds</option>
+  </select>
+  <button id="save" type="button">Save</button>
+  <div id="status" aria-live="polite"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

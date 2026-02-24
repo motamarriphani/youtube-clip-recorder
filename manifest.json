@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "YouTube Clip Recorder",
   "version": "0.1.0",
-  "description": "Record short video clips (up to 10s) from YouTube videos.",
+  "description": "Record short video clips from YouTube videos.",
   "permissions": [
     "tabCapture",
     "scripting",
@@ -24,6 +24,7 @@
     }
   ],
   "action": {
-    "default_title": "YouTube Clip Recorder"
+    "default_title": "YouTube Clip Recorder",
+    "default_popup": "popup.html"
   }
 }
