@@ -8,6 +8,21 @@
     /* Add a subtle border or background on hover? */
 }
 
+#yt-clip-recorder-audio-toggle {
+    display: inline-flex !important;
+    align-items: center;
+    gap: 4px;
+    margin-left: 8px;
+    color: white;
+    font-size: 0.75rem;
+    cursor: pointer;
+}
+
+#yt-clip-recorder-audio-toggle input {
+    margin: 0;
+    cursor: pointer;
+}
+
 #yt-clip-recorder-button:hover {
   /* background-color: rgba(255, 255, 255, 0.2); */
 }

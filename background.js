@@ -2,9 +2,33 @@ let mediaStream = null;
 let mediaRecorder = null;
 let recordedBlobs = [];
 let captureInfo = { title: "youtube_clip", timestamp: "00:00" }; // Store title/time
+let currentMimeType = "video/webm";
+let currentFileExtension = "webm";
 
-const VIDEO_MIME_TYPE = 'video/webm;codecs=vp9'; // VP9 is generally good for web
-// const VIDEO_MIME_TYPE = 'video/mp4;codecs=h264'; // Alternative, might have less browser support for recording
+const VIDEO_MIME_CANDIDATES = [
+    { type: 'video/webm;codecs=vp9,opus', extension: 'webm' },
+    { type: 'video/webm;codecs=vp8,opus', extension: 'webm' },
+    { type: 'video/webm;codecs=vp9', extension: 'webm' },
+    { type: 'video/webm;codecs=vp8', extension: 'webm' },
+    { type: 'video/webm', extension: 'webm' },
+    { type: 'video/mp4;codecs=avc1.42E01E,mp4a.40.2', extension: 'mp4' },
+    { type: 'video/mp4', extension: 'mp4' },
+];
+
+function selectSupportedMimeType(includeAudio) {
+    const compatibleType = VIDEO_MIME_CANDIDATES.find((candidate) => {
+        if (includeAudio && !candidate.type.includes('opus') && !candidate.type.includes('mp4a') && candidate.type.includes('codecs=')) {
+            return false;
+        }
+        return MediaRecorder.isTypeSupported(candidate.type);
+    });
+
+    if (compatibleType) {
+        return compatibleType;
+    }
+
+    return { type: '', extension: 'webm' };
+}
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // Use an async function here to allow 'await' and properly handle promises/sendResponse
@@ -18,6 +42,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
             console.log("Background: Received startRecording", message.payload);
             captureInfo = message.payload || captureInfo; // Store title/time
+            const includeAudio = Boolean(message.payload?.includeAudio);
 
             try {
                 // Important: Get the tab where the message came from
@@ -28,7 +53,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
                 // Start tab capture
                 mediaStream = await chrome.tabCapture.capture({
-                    audio: false, // No audio as requested
+                    audio: includeAudio,
                     video: true,
                     videoConstraints: {
                         mandatory: {
@@ -51,8 +76,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 // Clear previous blobs
                 recordedBlobs = [];
 
+                const selectedMime = selectSupportedMimeType(includeAudio);
+                currentMimeType = selectedMime.type || 'video/webm';
+                currentFileExtension = selectedMime.extension;
+
                 // Create MediaRecorder
-                 mediaRecorder = new MediaRecorder(mediaStream, { mimeType: VIDEO_MIME_TYPE });
+                const recorderOptions = selectedMime.type ? { mimeType: selectedMime.type } : undefined;
+                mediaRecorder = recorderOptions ? new MediaRecorder(mediaStream, recorderOptions) : new MediaRecorder(mediaStream);
 
                 mediaRecorder.ondataavailable = (event) => {
                     if (event.data && event.data.size > 0) {
@@ -102,12 +132,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 function handleRecordingStop() {
     console.log("Background: MediaRecorder stopped.");
     if (recordedBlobs && recordedBlobs.length > 0) {
-        const blob = new Blob(recordedBlobs, { type: VIDEO_MIME_TYPE });
+        const blob = new Blob(recordedBlobs, { type: currentMimeType });
 
         // Sanitize filename
         const safeTitle = captureInfo.title.replace(/[<>:"/\\|?*]+/g, '_').substring(0, 100); // Limit length too
         const timestamp = captureInfo.timestamp || "00:00";
-        const filename = `${safeTitle}_clip_${timestamp}.webm`; // Use .webm extension
+        const audioSuffix = captureInfo.includeAudio ? '_with-audio' : '';
+        const filename = `${safeTitle}_clip_${timestamp}${audioSuffix}.${currentFileExtension}`;
 
         const url = URL.createObjectURL(blob);
 

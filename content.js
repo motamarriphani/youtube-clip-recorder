@@ -1,9 +1,43 @@
 console.log("YouTube Clip Recorder: Content script loaded.");
 
 let recordButton = null;
+let audioToggle = null;
 let isRecording = false;
 let stopTimeoutId = null; // Timer to auto-stop recording
 const MAX_RECORD_DURATION_MS = 10000; // 10 seconds
+const AUDIO_PREF_KEY = 'includeTabAudio';
+
+async function getIncludeAudioPreference() {
+    const stored = await chrome.storage.local.get({ [AUDIO_PREF_KEY]: false });
+    return Boolean(stored[AUDIO_PREF_KEY]);
+}
+
+function createAudioToggle() {
+    if (document.getElementById('yt-clip-recorder-audio-toggle')) {
+        return document.getElementById('yt-clip-recorder-audio-toggle');
+    }
+
+    const label = document.createElement('label');
+    label.id = 'yt-clip-recorder-audio-toggle';
+    label.className = 'yt-clip-recorder-audio-toggle ytp-button';
+
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.id = 'yt-clip-recorder-audio-checkbox';
+    checkbox.title = 'Include tab audio in recording';
+
+    const text = document.createElement('span');
+    text.textContent = 'Audio';
+
+    checkbox.addEventListener('change', async () => {
+        await chrome.storage.local.set({ [AUDIO_PREF_KEY]: checkbox.checked });
+    });
+
+    label.appendChild(checkbox);
+    label.appendChild(text);
+
+    return label;
+}
 
 function createRecordButton() {
     if (document.getElementById('yt-clip-recorder-button')) {
@@ -25,14 +59,19 @@ function createRecordButton() {
     // This selector might change with YouTube updates!
     const controlsRight = document.querySelector('.ytp-right-controls');
     if (controlsRight) {
+        const toggle = createAudioToggle();
+
         // Insert it before the settings button for visibility
         const settingsButton = controlsRight.querySelector('.ytp-settings-button');
         if (settingsButton) {
+            controlsRight.insertBefore(toggle, settingsButton);
             controlsRight.insertBefore(button, settingsButton);
         } else {
              // Fallback: append to the end of right controls
+             controlsRight.appendChild(toggle);
              controlsRight.appendChild(button);
         }
+        audioToggle = toggle;
         console.log("YouTube Clip Recorder: Button injected.");
         return button;
     } else {
@@ -66,12 +105,13 @@ async function handleRecordButtonClick() {
         const videoTitle = document.title.replace(/ - YouTube$/, ''); // Get clean title
         const currentTimeSeconds = Math.floor(videoElement.currentTime);
         const timestamp = new Date(currentTimeSeconds * 1000).toISOString().substr(14, 5); // Format as MM:SS
+        const includeAudio = Boolean(audioToggle?.querySelector('input')?.checked);
 
         try {
             // Send message to background script to start
             await chrome.runtime.sendMessage({
                 action: "startRecording",
-                payload: { title: videoTitle, timestamp: timestamp }
+                payload: { title: videoTitle, timestamp: timestamp, includeAudio }
             });
             console.log("YouTube Clip Recorder: Start recording message sent.");
 
@@ -122,7 +162,7 @@ async function handleRecordButtonClick() {
 
 // --- Initialization and Handling YouTube's Dynamic Loading ---
 
-function initialize() {
+async function initialize() {
     // Check if button already exists (maybe from navigating back/forth)
     if (!document.getElementById('yt-clip-recorder-button')) {
         recordButton = createRecordButton();
@@ -136,6 +176,16 @@ function initialize() {
              recordButton.style.color = '';
              isRecording = false;
          }
+    }
+
+    if (!audioToggle) {
+        audioToggle = document.getElementById('yt-clip-recorder-audio-toggle');
+    }
+
+    const includeAudio = await getIncludeAudioPreference();
+    const checkbox = audioToggle?.querySelector('input');
+    if (checkbox) {
+        checkbox.checked = includeAudio;
     }
 }
 
@@ -163,9 +213,14 @@ const checkInterval = setInterval(() => {
         }
         // Remove button if it exists but we are not on a watch page anymore
         const existingButton = document.getElementById('yt-clip-recorder-button');
+        const existingToggle = document.getElementById('yt-clip-recorder-audio-toggle');
         if (existingButton) {
             existingButton.remove();
             recordButton = null;
+        }
+        if (existingToggle) {
+            existingToggle.remove();
+            audioToggle = null;
         }
     }
 }, 1000); // Check every second
