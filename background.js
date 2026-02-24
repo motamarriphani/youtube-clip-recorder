@@ -19,8 +19,178 @@ const VIDEO_MIME_CANDIDATES = [
 const RECORDING_STARTED_EVENT = "recordingStarted";
 const RECORDING_STOPPED_EVENT = "recordingStopped";
 const RECORDING_ERROR_EVENT = "recordingError";
+const CLIP_URL_REVOKE_DELAY_MS = 30000;
+const PERSISTED_CLIP_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const PENDING_CLIPS_DB_NAME = "ytClipRecorder";
+const PENDING_CLIPS_DB_VERSION = 1;
+const PENDING_CLIPS_STORE_NAME = "pendingClips";
 
 const pendingClips = new Map();
+
+function openPendingClipsDb() {
+    return new Promise((resolve, reject) => {
+        const request = indexedDB.open(PENDING_CLIPS_DB_NAME, PENDING_CLIPS_DB_VERSION);
+        request.onupgradeneeded = () => {
+            const db = request.result;
+            if (!db.objectStoreNames.contains(PENDING_CLIPS_STORE_NAME)) {
+                db.createObjectStore(PENDING_CLIPS_STORE_NAME, { keyPath: "clipId" });
+            }
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error || new Error("Failed to open pending clip store."));
+    });
+}
+
+async function persistPendingClip({ clipId, blob, filename, createdAt }) {
+    const db = await openPendingClipsDb();
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction(PENDING_CLIPS_STORE_NAME, "readwrite");
+        transaction.objectStore(PENDING_CLIPS_STORE_NAME).put({
+            clipId,
+            blob,
+            filename,
+            createdAt,
+        });
+        transaction.oncomplete = () => {
+            db.close();
+            resolve();
+        };
+        transaction.onerror = () => {
+            db.close();
+            reject(transaction.error || new Error("Failed to persist pending clip."));
+        };
+        transaction.onabort = () => {
+            db.close();
+            reject(transaction.error || new Error("Pending clip persistence aborted."));
+        };
+    });
+}
+
+async function loadPersistedPendingClip(clipId) {
+    const db = await openPendingClipsDb();
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction(PENDING_CLIPS_STORE_NAME, "readonly");
+        const request = transaction.objectStore(PENDING_CLIPS_STORE_NAME).get(clipId);
+        let result = null;
+
+        request.onsuccess = () => {
+            result = request.result || null;
+        };
+        request.onerror = () => {
+            db.close();
+            reject(request.error || new Error("Failed to read pending clip."));
+        };
+        transaction.oncomplete = () => {
+            db.close();
+            resolve(result);
+        };
+        transaction.onerror = () => {
+            db.close();
+            reject(transaction.error || new Error("Failed to complete pending clip read."));
+        };
+        transaction.onabort = () => {
+            db.close();
+            reject(transaction.error || new Error("Pending clip read aborted."));
+        };
+    });
+}
+
+async function deletePersistedPendingClip(clipId) {
+    const db = await openPendingClipsDb();
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction(PENDING_CLIPS_STORE_NAME, "readwrite");
+        transaction.objectStore(PENDING_CLIPS_STORE_NAME).delete(clipId);
+        transaction.oncomplete = () => {
+            db.close();
+            resolve();
+        };
+        transaction.onerror = () => {
+            db.close();
+            reject(transaction.error || new Error("Failed to delete pending clip."));
+        };
+        transaction.onabort = () => {
+            db.close();
+            reject(transaction.error || new Error("Pending clip deletion aborted."));
+        };
+    });
+}
+
+async function prunePersistedPendingClips(maxAgeMs = PERSISTED_CLIP_MAX_AGE_MS) {
+    const cutoff = Date.now() - maxAgeMs;
+    const db = await openPendingClipsDb();
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction(PENDING_CLIPS_STORE_NAME, "readwrite");
+        const store = transaction.objectStore(PENDING_CLIPS_STORE_NAME);
+        const cursorRequest = store.openCursor();
+
+        cursorRequest.onsuccess = () => {
+            const cursor = cursorRequest.result;
+            if (!cursor) {
+                return;
+            }
+
+            const record = cursor.value;
+            if (!record?.createdAt || record.createdAt < cutoff) {
+                cursor.delete();
+            }
+            cursor.continue();
+        };
+        cursorRequest.onerror = () => {
+            db.close();
+            reject(cursorRequest.error || new Error("Failed to prune pending clips."));
+        };
+        transaction.oncomplete = () => {
+            db.close();
+            resolve();
+        };
+        transaction.onerror = () => {
+            db.close();
+            reject(transaction.error || new Error("Pending clip prune failed."));
+        };
+        transaction.onabort = () => {
+            db.close();
+            reject(transaction.error || new Error("Pending clip prune aborted."));
+        };
+    });
+}
+
+function sanitizeFilenamePart(value, fallback) {
+    const sanitized = String(value || "")
+        .replace(/[<>:"/\\|?*\x00-\x1F]+/g, "_")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    return sanitized || fallback;
+}
+
+async function getPendingClip(clipId) {
+    const inMemoryClip = pendingClips.get(clipId);
+    if (inMemoryClip) {
+        return inMemoryClip;
+    }
+
+    const persistedClip = await loadPersistedPendingClip(clipId);
+    if (!persistedClip) {
+        return null;
+    }
+
+    const restoredClip = {
+        filename: persistedClip.filename,
+        blob: persistedClip.blob,
+        previewUrl: null,
+        createdAt: persistedClip.createdAt || Date.now(),
+    };
+    pendingClips.set(clipId, restoredClip);
+    return restoredClip;
+}
+
+function scheduleClipCleanup(clipId, delayMs = CLIP_URL_REVOKE_DELAY_MS) {
+    setTimeout(() => {
+        discardClip(clipId).catch((error) => {
+            console.warn(`Background: Failed to cleanup clip ${clipId}.`, error);
+        });
+    }, delayMs);
+}
 
 function selectSupportedMimeType(includeAudio) {
     const compatibleType = VIDEO_MIME_CANDIDATES.find((candidate) => {
@@ -161,7 +331,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             await saveClip(message.payload);
             sendResponse({ success: true });
         } else if (message.action === "discardClip") {
-            discardClip(message.payload?.clipId);
+            await discardClip(message.payload?.clipId);
             sendResponse({ success: true });
         }
     })();
@@ -180,14 +350,26 @@ async function handleRecordingStop(targetTabId) {
     }
 
     const blob = new Blob(recordedBlobs, { type: currentMimeType || 'video/webm' });
-    const safeTitle = captureInfo.title.replace(/[<>:"/\\|?*]+/g, '_').substring(0, 100);
+    const safeTitle = sanitizeFilenamePart(captureInfo.title, "youtube_clip").substring(0, 100);
     const timestamp = captureInfo.timestamp || "00:00";
+    const safeTimestamp = sanitizeFilenamePart(timestamp, "00_00");
     const audioSuffix = captureInfo.includeAudio ? '_with-audio' : '';
-    const filename = `${safeTitle}_clip_${timestamp}${audioSuffix}.${currentFileExtension || 'webm'}`;
-    const url = URL.createObjectURL(blob);
+    const filename = `${safeTitle}_clip_${safeTimestamp}${audioSuffix}.${currentFileExtension || 'webm'}`;
+    const previewUrl = URL.createObjectURL(blob);
     const clipId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const createdAt = Date.now();
 
-    pendingClips.set(clipId, { url, filename });
+    pendingClips.set(clipId, {
+        filename,
+        blob,
+        previewUrl,
+        createdAt,
+    });
+    try {
+        await persistPendingClip({ clipId, blob, filename, createdAt });
+    } catch (error) {
+        console.warn("Background: Failed to persist clip for service worker restore.", error);
+    }
 
     try {
         if (typeof targetTabId === "number") {
@@ -195,7 +377,7 @@ async function handleRecordingStop(targetTabId) {
                 action: "clipReadyForPreview",
                 payload: {
                     clipId,
-                    url,
+                    url: previewUrl,
                     filename,
                     title: captureInfo.title,
                     timestamp,
@@ -215,15 +397,17 @@ async function handleRecordingStop(targetTabId) {
 
 async function saveClip(payload = {}) {
     const { clipId, saveAs = false } = payload;
-    const clip = pendingClips.get(clipId);
-    if (!clip) {
+    const clip = await getPendingClip(clipId);
+    if (!clip || !clip.blob) {
         console.warn("Background: saveClip requested for missing clip", clipId);
         return;
     }
 
+    const downloadUrl = URL.createObjectURL(clip.blob);
+
     try {
         const downloadId = await chrome.downloads.download({
-            url: clip.url,
+            url: downloadUrl,
             filename: clip.filename,
             saveAs,
         });
@@ -232,17 +416,25 @@ async function saveClip(payload = {}) {
         console.error("Background: Failed to download clip", error);
         throw error;
     } finally {
-        setTimeout(() => discardClip(clipId), 30000);
+        setTimeout(() => URL.revokeObjectURL(downloadUrl), CLIP_URL_REVOKE_DELAY_MS);
+        scheduleClipCleanup(clipId);
     }
 }
 
-function discardClip(clipId) {
+async function discardClip(clipId) {
     if (!clipId) return;
     const clip = pendingClips.get(clipId);
-    if (!clip) return;
-
-    URL.revokeObjectURL(clip.url);
+    if (clip?.previewUrl) {
+        URL.revokeObjectURL(clip.previewUrl);
+    }
     pendingClips.delete(clipId);
+
+    try {
+        await deletePersistedPendingClip(clipId);
+    } catch (error) {
+        console.warn(`Background: Failed to remove persisted clip ${clipId}.`, error);
+    }
+
     console.log(`Background: Revoked clip URL for ${clipId}`);
 }
 
@@ -268,5 +460,9 @@ function stopCaptureResources() {
     currentMimeType = "video/webm";
     currentFileExtension = "webm";
 }
+
+prunePersistedPendingClips().catch((error) => {
+    console.warn("Background: Failed to prune stale clips.", error);
+});
 
 console.log("Background Service Worker started.");
