@@ -1,6 +1,7 @@
 let mediaStream = null;
 let mediaRecorder = null;
 let recordedBlobs = [];
+let recordingTabId = null;
 let captureInfo = { title: "youtube_clip", timestamp: "00:00", includeAudio: false };
 let currentMimeType = "video/webm";
 let currentFileExtension = "webm";
@@ -18,6 +19,8 @@ const VIDEO_MIME_CANDIDATES = [
 const RECORDING_STARTED_EVENT = "recordingStarted";
 const RECORDING_STOPPED_EVENT = "recordingStopped";
 const RECORDING_ERROR_EVENT = "recordingError";
+
+const pendingClips = new Map();
 
 function selectSupportedMimeType(includeAudio) {
     const compatibleType = VIDEO_MIME_CANDIDATES.find((candidate) => {
@@ -62,6 +65,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 if (!targetTabId) {
                     throw new Error("Could not get sender tab ID.");
                 }
+                recordingTabId = targetTabId;
 
                 mediaStream = await chrome.tabCapture.capture({
                     audio: includeAudio,
@@ -119,7 +123,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     }
                 };
 
-                mediaRecorder.onstop = handleRecordingStop;
+                mediaRecorder.onstop = () => handleRecordingStop(recordingTabId);
 
                 mediaRecorder.onerror = (event) => {
                     const errorMessage = event.error?.message || "MediaRecorder error";
@@ -153,62 +157,116 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 emitRecordingState(RECORDING_STOPPED_EVENT, { reason: "alreadyInactive" });
                 sendResponse({ success: false, message: "Recorder not active." });
             }
+        } else if (message.action === "saveClip") {
+            await saveClip(message.payload);
+            sendResponse({ success: true });
+        } else if (message.action === "discardClip") {
+            discardClip(message.payload?.clipId);
+            sendResponse({ success: true });
         }
     })();
 
     return true;
 });
 
-function handleRecordingStop() {
+async function handleRecordingStop(targetTabId) {
     console.log("Background: MediaRecorder stopped.");
-    if (recordedBlobs && recordedBlobs.length > 0) {
-        const blob = new Blob(recordedBlobs, { type: currentMimeType });
 
-        const safeTitle = captureInfo.title.replace(/[<>:"/\\|?*]+/g, '_').substring(0, 100);
-        const timestamp = captureInfo.timestamp || "00:00";
-        const audioSuffix = captureInfo.includeAudio ? '_with-audio' : '';
-        const filename = `${safeTitle}_clip_${timestamp}${audioSuffix}.${currentFileExtension}`;
-
-        const url = URL.createObjectURL(blob);
-
-        console.log(`Background: Triggering download for ${filename}`);
-        chrome.downloads.download({
-            url: url,
-            filename: filename,
-        }).then(downloadId => {
-            console.log(`Background: Download started with ID: ${downloadId}`);
-        }).catch(error => {
-            console.error("Background: Download failed:", error);
-            URL.revokeObjectURL(url);
-            emitRecordingState(RECORDING_ERROR_EVENT, { message: error.message || "Download failed" });
-        });
-
-        recordedBlobs = [];
-    } else {
-        console.warn("Background: Recording stopped but no data blobs found.");
+    if (!recordedBlobs || recordedBlobs.length === 0) {
+        console.warn("Background: No recorded data available.");
+        stopCaptureResources();
+        emitRecordingState(RECORDING_STOPPED_EVENT, { reason: "noData" });
+        return;
     }
 
-    stopCaptureResources();
-    emitRecordingState(RECORDING_STOPPED_EVENT, { reason: "stopped" });
+    const blob = new Blob(recordedBlobs, { type: currentMimeType || 'video/webm' });
+    const safeTitle = captureInfo.title.replace(/[<>:"/\\|?*]+/g, '_').substring(0, 100);
+    const timestamp = captureInfo.timestamp || "00:00";
+    const audioSuffix = captureInfo.includeAudio ? '_with-audio' : '';
+    const filename = `${safeTitle}_clip_${timestamp}${audioSuffix}.${currentFileExtension || 'webm'}`;
+    const url = URL.createObjectURL(blob);
+    const clipId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    pendingClips.set(clipId, { url, filename });
+
+    try {
+        if (typeof targetTabId === "number") {
+            await chrome.tabs.sendMessage(targetTabId, {
+                action: "clipReadyForPreview",
+                payload: {
+                    clipId,
+                    url,
+                    filename,
+                    title: captureInfo.title,
+                    timestamp,
+                },
+            });
+            console.log(`Background: Clip preview sent for ${filename}`);
+        }
+    } catch (error) {
+        console.error("Background: Failed to show preview, falling back to auto-download.", error);
+        await saveClip({ clipId, saveAs: false });
+    } finally {
+        stopCaptureResources();
+        recordingTabId = null;
+        emitRecordingState(RECORDING_STOPPED_EVENT, { reason: "stopped" });
+    }
+}
+
+async function saveClip(payload = {}) {
+    const { clipId, saveAs = false } = payload;
+    const clip = pendingClips.get(clipId);
+    if (!clip) {
+        console.warn("Background: saveClip requested for missing clip", clipId);
+        return;
+    }
+
+    try {
+        const downloadId = await chrome.downloads.download({
+            url: clip.url,
+            filename: clip.filename,
+            saveAs,
+        });
+        console.log(`Background: Download started with ID: ${downloadId}`);
+    } catch (error) {
+        console.error("Background: Failed to download clip", error);
+        throw error;
+    } finally {
+        setTimeout(() => discardClip(clipId), 30000);
+    }
+}
+
+function discardClip(clipId) {
+    if (!clipId) return;
+    const clip = pendingClips.get(clipId);
+    if (!clip) return;
+
+    URL.revokeObjectURL(clip.url);
+    pendingClips.delete(clipId);
+    console.log(`Background: Revoked clip URL for ${clipId}`);
 }
 
 function stopCaptureResources() {
-    if (mediaRecorder && mediaRecorder.state !== "inactive") {
-        try {
-            mediaRecorder.stop();
-        } catch (e) {
-            console.warn("Error trying to stop recorder during cleanup:", e);
-        }
+    if (mediaRecorder) {
+        mediaRecorder.onstop = null;
+        mediaRecorder.ondataavailable = null;
+        mediaRecorder.onerror = null;
+        mediaRecorder = null;
     }
+
     if (mediaStream) {
-        mediaStream.getTracks().forEach(track => track.stop());
-        console.log("Background: MediaStream tracks stopped.");
+        mediaStream.getTracks().forEach((track) => {
+            if (track.readyState === "live") {
+                track.stop();
+                console.log(`Background: Stopped track: ${track.kind}`);
+            }
+        });
+        mediaStream = null;
     }
-    mediaRecorder = null;
-    mediaStream = null;
+
+    recordedBlobs = [];
     currentMimeType = "video/webm";
     currentFileExtension = "webm";
-    console.log("Background: Capture resources released.");
 }
 
 console.log("Background Service Worker started.");

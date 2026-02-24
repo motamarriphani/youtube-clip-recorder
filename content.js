@@ -12,6 +12,9 @@ let lastUrl = location.href;
 let lastIsWatchPage = false;
 let reinjectDebounceId = null;
 
+let activePreviewClipId = null;
+let previewModalEl = null;
+
 const DEFAULT_MAX_RECORD_DURATION_MS = 10000;
 const MIN_RECORD_DURATION_SECONDS = 3;
 const MAX_RECORD_DURATION_SECONDS = 60;
@@ -231,20 +234,108 @@ async function handleRecordButtonClick() {
     }
 }
 
+function showPreviewModal({ clipId, url, filename }) {
+    discardPreviewLocally();
+    activePreviewClipId = clipId;
+
+    const overlay = document.createElement('div');
+    overlay.id = 'yt-clip-preview-overlay';
+    overlay.innerHTML = `
+        <div class="yt-clip-preview-modal" role="dialog" aria-label="Clip preview">
+            <button class="yt-clip-preview-close" aria-label="Close preview">✕</button>
+            <h3>Preview Clip</h3>
+            <video controls src="${url}"></video>
+            <p class="yt-clip-preview-filename">${filename}</p>
+            <div class="yt-clip-preview-actions">
+                <button class="yt-clip-btn yt-clip-save">Save</button>
+                <button class="yt-clip-btn yt-clip-save-as">Save As…</button>
+                <button class="yt-clip-btn yt-clip-discard">Discard</button>
+            </div>
+        </div>
+    `;
+
+    const onDiscard = async () => {
+        if (!activePreviewClipId) return;
+        await chrome.runtime.sendMessage({
+            action: "discardClip",
+            payload: { clipId: activePreviewClipId },
+        });
+        discardPreviewLocally();
+    };
+
+    overlay.querySelector('.yt-clip-save')?.addEventListener('click', async () => {
+        if (!activePreviewClipId) return;
+        await chrome.runtime.sendMessage({
+            action: "saveClip",
+            payload: { clipId: activePreviewClipId, saveAs: false },
+        });
+        discardPreviewLocally();
+    });
+
+    overlay.querySelector('.yt-clip-save-as')?.addEventListener('click', async () => {
+        if (!activePreviewClipId) return;
+        await chrome.runtime.sendMessage({
+            action: "saveClip",
+            payload: { clipId: activePreviewClipId, saveAs: true },
+        });
+        discardPreviewLocally();
+    });
+
+    overlay.querySelector('.yt-clip-discard')?.addEventListener('click', onDiscard);
+    overlay.querySelector('.yt-clip-preview-close')?.addEventListener('click', onDiscard);
+    overlay.addEventListener('click', (event) => {
+        if (event.target === overlay) {
+            onDiscard();
+        }
+    });
+
+    document.body.appendChild(overlay);
+    previewModalEl = overlay;
+}
+
+function discardPreviewLocally() {
+    if (previewModalEl) {
+        previewModalEl.remove();
+        previewModalEl = null;
+    }
+    activePreviewClipId = null;
+}
+
+async function cleanupPreviewOnUnload() {
+    if (!activePreviewClipId) return;
+    try {
+        await chrome.runtime.sendMessage({
+            action: "discardClip",
+            payload: { clipId: activePreviewClipId },
+        });
+    } catch (error) {
+        console.warn("YouTube Clip Recorder: Failed to cleanup preview clip.", error);
+    }
+}
+
 chrome.runtime.onMessage.addListener((message) => {
-    if (!message?.type) return;
+    if (!message) return;
+
+    if (message.action === 'clipReadyForPreview') {
+        showPreviewModal(message.payload);
+        return;
+    }
 
     if (message.type === RECORDING_STARTED_EVENT) {
-        await applyRecordingState();
-    }
-
-    if (message.type === RECORDING_STOPPED_EVENT) {
+        applyRecordingState();
+    } else if (message.type === RECORDING_STOPPED_EVENT) {
         resetUIState();
-    }
-
-    if (message.type === RECORDING_ERROR_EVENT) {
+    } else if (message.type === RECORDING_ERROR_EVENT) {
         console.error('YouTube Clip Recorder: Background recording error.', message.payload?.message || message.payload);
         resetUIState();
+    }
+});
+
+window.addEventListener('beforeunload', cleanupPreviewOnUnload);
+
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+        cleanupPreviewOnUnload();
     }
 });
 
@@ -315,6 +406,8 @@ function handleRouteOrStateChange() {
         existingToggle.remove();
         audioToggle = null;
     }
+
+    discardPreviewLocally();
 }
 
 function startDomObservation() {
