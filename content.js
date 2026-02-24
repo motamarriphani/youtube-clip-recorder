@@ -11,9 +11,16 @@ let urlCheckObserver = null;
 let lastUrl = location.href;
 let lastIsWatchPage = false;
 let reinjectDebounceId = null;
+let injectionHeartbeatId = null;
 
 let activePreviewClipId = null;
 let previewModalEl = null;
+let localMediaStream = null;
+let localMediaRecorder = null;
+let localRecordedChunks = [];
+let activeRecordingMode = null;
+let localRecordingMeta = null;
+const localPendingClips = new Map();
 
 const DEFAULT_MAX_RECORD_DURATION_MS = 10000;
 const MIN_RECORD_DURATION_SECONDS = 3;
@@ -21,18 +28,50 @@ const MAX_RECORD_DURATION_SECONDS = 60;
 const STORAGE_KEY_MAX_DURATION_SECONDS = 'maxRecordDurationSeconds';
 const AUDIO_PREF_KEY = 'includeTabAudio';
 const REINJECT_DEBOUNCE_MS = 150;
+const INJECTION_HEARTBEAT_MS = 1000;
+const INVALID_CONTEXT_RELOAD_GUARD_KEY = 'ytClipRecorderInvalidContextReloaded';
+const LOCAL_RECORDING_MODE = 'local';
+const BACKGROUND_RECORDING_MODE = 'background';
+const LOCAL_RECORDING_TIMESLICE_MS = 100;
 
 const RECORDING_STARTED_EVENT = "recordingStarted";
 const RECORDING_STOPPED_EVENT = "recordingStopped";
 const RECORDING_ERROR_EVENT = "recordingError";
 
+const VIDEO_MIME_CANDIDATES = [
+    { type: 'video/webm;codecs=vp9,opus', extension: 'webm' },
+    { type: 'video/webm;codecs=vp8,opus', extension: 'webm' },
+    { type: 'video/webm;codecs=vp9', extension: 'webm' },
+    { type: 'video/webm;codecs=vp8', extension: 'webm' },
+    { type: 'video/webm', extension: 'webm' },
+    { type: 'video/mp4;codecs=avc1.42E01E,mp4a.40.2', extension: 'mp4' },
+    { type: 'video/mp4', extension: 'mp4' },
+];
+
 function isWatchPageUrl(url = location.href) {
     try {
         const parsed = new URL(url);
-        return parsed.pathname === '/watch';
+        const pathname = parsed.pathname || '';
+        if (pathname === '/watch') {
+            return true;
+        }
+        if (pathname.startsWith('/embed/')) {
+            return true;
+        }
+        if (pathname.startsWith('/live/')) {
+            return true;
+        }
+        if (pathname.startsWith('/shorts/')) {
+            return true;
+        }
     } catch (_) {
-        return url.includes('/watch');
+        if (url.includes('/watch') || url.includes('/embed/') || url.includes('/live/') || url.includes('/shorts/')) {
+            return true;
+        }
     }
+
+    // Fallback for YouTube SPA states where URL and player state are briefly out of sync.
+    return Boolean(document.querySelector('video.html5-main-video'));
 }
 
 function clampDurationSeconds(value) {
@@ -63,6 +102,235 @@ function escapeHtml(value) {
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#39;");
+}
+
+function isExtensionContextInvalidatedError(error) {
+    const message = String(error?.message || error || "");
+    return message.includes("Extension context invalidated");
+}
+
+function recoverFromInvalidatedContext() {
+    try {
+        if (sessionStorage.getItem(INVALID_CONTEXT_RELOAD_GUARD_KEY) === '1') {
+            alert("Extension was updated. Please refresh this tab.");
+            return;
+        }
+        sessionStorage.setItem(INVALID_CONTEXT_RELOAD_GUARD_KEY, '1');
+    } catch (_) {
+        // no-op
+    }
+
+    location.reload();
+}
+
+async function sendRuntimeMessage(message, options = {}) {
+    const { recoverOnInvalidation = true } = options;
+
+    try {
+        const response = await chrome.runtime.sendMessage(message);
+        try {
+            sessionStorage.removeItem(INVALID_CONTEXT_RELOAD_GUARD_KEY);
+        } catch (_) {
+            // no-op
+        }
+        return response;
+    } catch (error) {
+        if (recoverOnInvalidation && isExtensionContextInvalidatedError(error)) {
+            console.warn("YouTube Clip Recorder: Extension context invalidated. Reloading page to recover.");
+            recoverFromInvalidatedContext();
+            return null;
+        }
+        throw error;
+    }
+}
+
+function selectSupportedMimeType(includeAudio) {
+    const compatibleType = VIDEO_MIME_CANDIDATES.find((candidate) => {
+        if (includeAudio && candidate.type.includes('codecs=') && !candidate.type.includes('opus') && !candidate.type.includes('mp4a')) {
+            return false;
+        }
+        return MediaRecorder.isTypeSupported(candidate.type);
+    });
+
+    if (compatibleType) {
+        return compatibleType;
+    }
+
+    return { type: '', extension: 'webm' };
+}
+
+function sanitizeFilenamePart(value, fallback) {
+    const sanitized = String(value || '')
+        .replace(/[<>:"/\\|?*\x00-\x1F]+/g, '_')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    return sanitized || fallback;
+}
+
+function shouldUseLocalCaptureFallback(message) {
+    const value = String(message || '').toLowerCase();
+    return value.includes('not been invoked for the current page')
+        || value.includes('capture permission is not active for this tab')
+        || value.includes('activetab permission');
+}
+
+function isLocalClipId(clipId) {
+    return typeof clipId === 'string' && clipId.startsWith('local_');
+}
+
+function cleanupLocalRecorderResources() {
+    if (localMediaRecorder) {
+        localMediaRecorder.onstop = null;
+        localMediaRecorder.ondataavailable = null;
+        localMediaRecorder.onerror = null;
+        localMediaRecorder = null;
+    }
+
+    if (localMediaStream) {
+        localMediaStream.getTracks().forEach((track) => {
+            if (track.readyState === 'live') {
+                track.stop();
+            }
+        });
+        localMediaStream = null;
+    }
+
+    localRecordedChunks = [];
+    localRecordingMeta = null;
+}
+
+function discardLocalClip(clipId) {
+    const clip = localPendingClips.get(clipId);
+    if (!clip) {
+        return;
+    }
+    URL.revokeObjectURL(clip.url);
+    localPendingClips.delete(clipId);
+}
+
+function triggerLocalDownload(url, filename) {
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.rel = 'noopener';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+}
+
+function saveLocalClip(clipId, saveAs = false) {
+    const clip = localPendingClips.get(clipId);
+    if (!clip) {
+        return;
+    }
+
+    triggerLocalDownload(clip.url, clip.filename);
+    if (saveAs) {
+        console.info('YouTube Clip Recorder: Save As requested for local fallback; browser download settings control destination prompt.');
+    }
+    discardLocalClip(clipId);
+}
+
+function finalizeLocalRecordingStop() {
+    const chunks = [...localRecordedChunks];
+    const metadata = localRecordingMeta;
+    cleanupLocalRecorderResources();
+    activeRecordingMode = null;
+    resetUIState();
+
+    if (!chunks.length || !metadata) {
+        return;
+    }
+
+    const mimeType = metadata.mimeType || 'video/webm';
+    const fileExtension = metadata.fileExtension || 'webm';
+    const blob = new Blob(chunks, { type: mimeType });
+    if (blob.size === 0) {
+        return;
+    }
+
+    const safeTitle = sanitizeFilenamePart(metadata.title, 'youtube_clip').substring(0, 100);
+    const safeTimestamp = sanitizeFilenamePart(metadata.timestamp, '00_00');
+    const audioSuffix = metadata.includeAudio ? '_with-audio' : '';
+    const filename = `${safeTitle}_clip_${safeTimestamp}${audioSuffix}.${fileExtension}`;
+    const clipId = `local_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const url = URL.createObjectURL(blob);
+
+    localPendingClips.set(clipId, { url, filename });
+    showPreviewModal({ clipId, url, filename });
+}
+
+async function startLocalRecording({ title, timestamp, includeAudio }) {
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+        throw new Error('This browser does not support local display capture fallback.');
+    }
+
+    const selectedMime = selectSupportedMimeType(includeAudio);
+    const recorderOptions = selectedMime.type ? { mimeType: selectedMime.type } : undefined;
+
+    try {
+        localMediaStream = await navigator.mediaDevices.getDisplayMedia({
+            video: {
+                frameRate: { ideal: 30 },
+                width: { ideal: 1920 },
+                height: { ideal: 1080 },
+            },
+            audio: includeAudio,
+        });
+    } catch (error) {
+        throw new Error(error?.message || 'Display capture request was cancelled or denied.');
+    }
+
+    const videoTracks = localMediaStream.getVideoTracks();
+    if (!videoTracks.length) {
+        cleanupLocalRecorderResources();
+        throw new Error('Display capture did not provide a video track.');
+    }
+
+    localRecordedChunks = [];
+    localRecordingMeta = {
+        title,
+        timestamp,
+        includeAudio,
+        mimeType: selectedMime.type || 'video/webm',
+        fileExtension: selectedMime.extension || 'webm',
+    };
+
+    localMediaRecorder = recorderOptions
+        ? new MediaRecorder(localMediaStream, recorderOptions)
+        : new MediaRecorder(localMediaStream);
+
+    localMediaRecorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+            localRecordedChunks.push(event.data);
+        }
+    };
+
+    localMediaRecorder.onerror = (event) => {
+        const message = event.error?.message || 'Local recording failed.';
+        console.error('YouTube Clip Recorder: Local fallback recorder error.', event.error);
+        cleanupLocalRecorderResources();
+        activeRecordingMode = null;
+        resetUIState();
+        alert(`Error during local recording: ${message}`);
+    };
+
+    localMediaRecorder.onstop = () => {
+        finalizeLocalRecordingStop();
+    };
+
+    videoTracks.forEach((track) => {
+        track.onended = () => {
+            if (localMediaRecorder?.state === 'recording') {
+                localMediaRecorder.stop();
+            }
+        };
+    });
+
+    localMediaRecorder.start(LOCAL_RECORDING_TIMESLICE_MS);
+    activeRecordingMode = LOCAL_RECORDING_MODE;
+    await applyRecordingState();
 }
 
 async function getMaxRecordDurationMs() {
@@ -106,6 +374,7 @@ function setButtonState({ text, color = '', disabled = false }) {
 function resetUIState() {
     isRecording = false;
     isTransitioning = false;
+    activeRecordingMode = null;
     clearTimers();
     setButtonState({ text: 'REC Clip', color: '', disabled: false });
 }
@@ -132,7 +401,16 @@ async function requestStopRecording() {
     setButtonState({ text: 'Stopping...', color: '', disabled: true });
 
     try {
-        await chrome.runtime.sendMessage({ action: "stopRecording" });
+        if (activeRecordingMode === LOCAL_RECORDING_MODE) {
+            if (localMediaRecorder && localMediaRecorder.state === 'recording') {
+                localMediaRecorder.stop();
+            } else {
+                resetUIState();
+            }
+            return;
+        }
+
+        await sendRuntimeMessage({ action: "stopRecording" });
         console.log("YouTube Clip Recorder: Stop recording message sent.");
         reenableTimeoutId = setTimeout(() => {
             if (!isRecording) {
@@ -179,6 +457,37 @@ function createAudioToggle() {
     return label;
 }
 
+function getControlsInsertAnchor(controlsContainer) {
+    const settingsButton = controlsContainer.querySelector('.ytp-settings-button');
+    if (!settingsButton) {
+        return null;
+    }
+
+    let anchor = settingsButton;
+    while (anchor && anchor.parentElement !== controlsContainer) {
+        anchor = anchor.parentElement;
+    }
+
+    if (anchor && anchor.parentElement === controlsContainer) {
+        return anchor;
+    }
+
+    return null;
+}
+
+function safeInsertIntoControls(controlsContainer, element, anchor) {
+    if (!controlsContainer || !element) {
+        return;
+    }
+
+    if (anchor && anchor.parentElement === controlsContainer) {
+        controlsContainer.insertBefore(element, anchor);
+        return;
+    }
+
+    controlsContainer.appendChild(element);
+}
+
 function createRecordButton() {
     const existingButton = document.getElementById('yt-clip-recorder-button');
     if (existingButton) {
@@ -200,15 +509,10 @@ function createRecordButton() {
     button.onclick = handleRecordButtonClick;
 
     const toggle = createAudioToggle();
+    const anchor = getControlsInsertAnchor(controlsRight);
+    safeInsertIntoControls(controlsRight, toggle, anchor);
+    safeInsertIntoControls(controlsRight, button, anchor);
 
-    const settingsButton = controlsRight.querySelector('.ytp-settings-button');
-    if (settingsButton) {
-        controlsRight.insertBefore(toggle, settingsButton);
-        controlsRight.insertBefore(button, settingsButton);
-    } else {
-        controlsRight.appendChild(toggle);
-        controlsRight.appendChild(button);
-    }
     audioToggle = toggle;
 
     console.log('YouTube Clip Recorder: Button and audio toggle injected.');
@@ -235,16 +539,26 @@ async function handleRecordButtonClick() {
         const includeAudio = Boolean(audioToggle?.querySelector('input')?.checked);
 
         try {
-            const response = await chrome.runtime.sendMessage({
+            const response = await sendRuntimeMessage({
                 action: "startRecording",
                 payload: { title: videoTitle, timestamp: timestamp, includeAudio }
             });
 
+            if (response === null) {
+                return;
+            }
+
             if (!response?.success) {
+                if (shouldUseLocalCaptureFallback(response?.message)) {
+                    console.warn('YouTube Clip Recorder: Falling back to local display capture mode.');
+                    await startLocalRecording({ title: videoTitle, timestamp, includeAudio });
+                    return;
+                }
                 throw new Error(response?.message || "Failed to start recording.");
             }
 
             console.log("YouTube Clip Recorder: Start recording message sent.");
+            activeRecordingMode = BACKGROUND_RECORDING_MODE;
             await applyRecordingState();
         } catch (error) {
             console.error("YouTube Clip Recorder: Error starting recording.", error);
@@ -278,28 +592,51 @@ function showPreviewModal({ clipId, url, filename }) {
 
     const onDiscard = async () => {
         if (!activePreviewClipId) return;
-        await chrome.runtime.sendMessage({
+        if (isLocalClipId(activePreviewClipId)) {
+            discardLocalClip(activePreviewClipId);
+            discardPreviewLocally();
+            return;
+        }
+
+        const response = await sendRuntimeMessage({
             action: "discardClip",
             payload: { clipId: activePreviewClipId },
         });
+        if (response === null) return;
         discardPreviewLocally();
     };
 
     overlay.querySelector('.yt-clip-save')?.addEventListener('click', async () => {
         if (!activePreviewClipId) return;
-        await chrome.runtime.sendMessage({
+
+        if (isLocalClipId(activePreviewClipId)) {
+            saveLocalClip(activePreviewClipId, false);
+            discardPreviewLocally();
+            return;
+        }
+
+        const response = await sendRuntimeMessage({
             action: "saveClip",
             payload: { clipId: activePreviewClipId, saveAs: false },
         });
+        if (response === null) return;
         discardPreviewLocally();
     });
 
     overlay.querySelector('.yt-clip-save-as')?.addEventListener('click', async () => {
         if (!activePreviewClipId) return;
-        await chrome.runtime.sendMessage({
+
+        if (isLocalClipId(activePreviewClipId)) {
+            saveLocalClip(activePreviewClipId, true);
+            discardPreviewLocally();
+            return;
+        }
+
+        const response = await sendRuntimeMessage({
             action: "saveClip",
             payload: { clipId: activePreviewClipId, saveAs: true },
         });
+        if (response === null) return;
         discardPreviewLocally();
     });
 
@@ -325,11 +662,17 @@ function discardPreviewLocally() {
 
 async function cleanupPreviewOnUnload() {
     if (!activePreviewClipId) return;
+
+    if (isLocalClipId(activePreviewClipId)) {
+        discardLocalClip(activePreviewClipId);
+        return;
+    }
+
     try {
-        await chrome.runtime.sendMessage({
+        await sendRuntimeMessage({
             action: "discardClip",
             payload: { clipId: activePreviewClipId },
-        });
+        }, { recoverOnInvalidation: false });
     } catch (error) {
         console.warn("YouTube Clip Recorder: Failed to cleanup preview clip.", error);
     }
@@ -344,6 +687,7 @@ chrome.runtime.onMessage.addListener((message) => {
     }
 
     if (message.type === RECORDING_STARTED_EVENT) {
+        activeRecordingMode = BACKGROUND_RECORDING_MODE;
         applyRecordingState();
     } else if (message.type === RECORDING_STOPPED_EVENT) {
         resetUIState();
@@ -389,6 +733,16 @@ function debouncedInitialize() {
     }, REINJECT_DEBOUNCE_MS);
 }
 
+function ensureRecorderControlsInjected() {
+    if (!isWatchPageUrl()) return;
+
+    const hasButton = Boolean(document.getElementById('yt-clip-recorder-button'));
+    const hasControls = Boolean(document.querySelector('.ytp-right-controls'));
+    if (!hasButton && hasControls) {
+        debouncedInitialize();
+    }
+}
+
 function handleRouteOrStateChange() {
     const currentUrl = location.href;
     const currentIsWatchPage = isWatchPageUrl(currentUrl);
@@ -409,8 +763,7 @@ function handleRouteOrStateChange() {
 
     if (isRecording) {
         console.log("YouTube Clip Recorder: Navigated away, stopping recording.");
-        chrome.runtime.sendMessage({ action: "stopRecording" }).catch(e => console.log("Error sending stop on navigate away:", e));
-        resetUIState();
+        requestStopRecording().catch((e) => console.log("Error stopping recording on navigate away:", e));
     }
 
     const existingButton = document.getElementById('yt-clip-recorder-button');
@@ -435,17 +788,23 @@ function startDomObservation() {
 
     const target = document.querySelector('#movie_player, ytd-player, ytd-watch-flexy') || document.body;
     domObserver = new MutationObserver(() => {
-        if (!isWatchPageUrl()) return;
-
-        if (!document.getElementById('yt-clip-recorder-button') && document.querySelector('.ytp-right-controls')) {
-            debouncedInitialize();
-        }
+        ensureRecorderControlsInjected();
     });
 
     domObserver.observe(target, {
         childList: true,
         subtree: true
     });
+}
+
+function startInjectionHeartbeat() {
+    if (injectionHeartbeatId) {
+        clearInterval(injectionHeartbeatId);
+    }
+
+    injectionHeartbeatId = setInterval(() => {
+        ensureRecorderControlsInjected();
+    }, INJECTION_HEARTBEAT_MS);
 }
 
 function startUrlObservation() {
@@ -479,12 +838,20 @@ function startUrlObservation() {
 }
 
 function bootstrap() {
+    try {
+        sessionStorage.removeItem(INVALID_CONTEXT_RELOAD_GUARD_KEY);
+    } catch (_) {
+        // no-op
+    }
+
     lastUrl = location.href;
     lastIsWatchPage = isWatchPageUrl(lastUrl);
 
     startDomObservation();
     startUrlObservation();
+    startInjectionHeartbeat();
     handleRouteOrStateChange();
+    ensureRecorderControlsInjected();
     debouncedInitialize();
 }
 

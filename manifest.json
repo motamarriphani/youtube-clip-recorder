@@ -3,8 +3,11 @@
   "name": "YouTube Clip Recorder",
   "version": "0.1.0",
   "description": "Record short video clips from YouTube videos.",
+  "minimum_chrome_version": "116",
   "permissions": [
     "tabCapture",
+    "activeTab",
+    "offscreen",
     "scripting",
     "downloads",
     "storage"
@@ -17,7 +20,7 @@
   },
   "content_scripts": [
     {
-      "matches": ["*://*.youtube.com/watch*"],
+      "matches": ["*://*.youtube.com/*"],
       "js": ["content.js"],
       "css": ["style.css"],
       "run_at": "document_idle"
