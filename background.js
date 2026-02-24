@@ -2,11 +2,35 @@ let mediaStream = null;
 let mediaRecorder = null;
 let recordedBlobs = [];
 let captureInfo = { title: "youtube_clip", timestamp: "00:00" }; // Store title/time
+let selectedVideoMimeType = null;
 
-const VIDEO_MIME_TYPE = 'video/webm;codecs=vp9'; // VP9 is generally good for web
+const VIDEO_MIME_CANDIDATES = [
+    'video/webm;codecs=vp9',
+    'video/webm;codecs=vp8',
+    'video/webm',
+];
 const RECORDING_STARTED_EVENT = "recordingStarted";
 const RECORDING_STOPPED_EVENT = "recordingStopped";
 const RECORDING_ERROR_EVENT = "recordingError";
+
+function selectSupportedMimeType() {
+    const supportedType = VIDEO_MIME_CANDIDATES.find((mimeType) => MediaRecorder.isTypeSupported(mimeType));
+    if (supportedType) {
+        console.log(`Background: Using recording MIME type: ${supportedType}`);
+        return supportedType;
+    }
+
+    console.error(`Background: No supported MIME types found. Candidates: ${VIDEO_MIME_CANDIDATES.join(', ')}`);
+    return null;
+}
+
+function getExtensionFromMimeType(mimeType) {
+    if (mimeType && mimeType.includes('webm')) {
+        return 'webm';
+    }
+
+    return 'webm';
+}
 
 function emitRecordingState(type, payload = {}) {
     chrome.runtime.sendMessage({ type, payload }).catch((error) => {
@@ -76,8 +100,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 // Clear previous blobs
                 recordedBlobs = [];
 
+                selectedVideoMimeType = selectSupportedMimeType();
+                if (!selectedVideoMimeType) {
+                    stopCaptureResources();
+                    sendResponse({
+                        success: false,
+                        message: "This browser/system does not support any compatible recording format (VP9/VP8/WebM). Please update your browser or try another device.",
+                    });
+                    return;
+                }
+
                 // Create MediaRecorder
-                mediaRecorder = new MediaRecorder(mediaStream, { mimeType: VIDEO_MIME_TYPE });
+                mediaRecorder = new MediaRecorder(mediaStream, { mimeType: selectedVideoMimeType });
 
                 mediaRecorder.ondataavailable = (event) => {
                     if (event.data && event.data.size > 0) {
@@ -134,12 +168,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 function handleRecordingStop() {
     console.log("Background: MediaRecorder stopped.");
     if (recordedBlobs && recordedBlobs.length > 0) {
-        const blob = new Blob(recordedBlobs, { type: VIDEO_MIME_TYPE });
+        const blobMimeType = selectedVideoMimeType || 'video/webm';
+        const blob = new Blob(recordedBlobs, { type: blobMimeType });
+        const extension = getExtensionFromMimeType(blobMimeType);
+        console.log(`Background: Finalizing blob with MIME type: ${blobMimeType}`);
 
         // Sanitize filename
         const safeTitle = captureInfo.title.replace(/[<>:"/\\|?*]+/g, '_').substring(0, 100); // Limit length too
         const timestamp = captureInfo.timestamp || "00:00";
-        const filename = `${safeTitle}_clip_${timestamp}.webm`; // Use .webm extension
+        const filename = `${safeTitle}_clip_${timestamp}.${extension}`;
 
         const url = URL.createObjectURL(blob);
 
@@ -185,6 +222,7 @@ function stopCaptureResources() {
     }
     mediaRecorder = null;
     mediaStream = null;
+    selectedVideoMimeType = null;
     console.log("Background: Capture resources released.");
 }
 
