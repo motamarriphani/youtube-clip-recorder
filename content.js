@@ -419,7 +419,7 @@ function startDomObservation() {
     domObserver = new MutationObserver(() => {
         if (!isWatchPageUrl()) return;
 
-        if (!document.getElementById('yt-clip-recorder-button') || document.querySelector('.ytp-right-controls')) {
+        if (!document.getElementById('yt-clip-recorder-button') && document.querySelector('.ytp-right-controls')) {
             debouncedInitialize();
         }
     });
