@@ -3,7 +3,32 @@ console.log("YouTube Clip Recorder: Content script loaded.");
 let recordButton = null;
 let isRecording = false;
 let stopTimeoutId = null; // Timer to auto-stop recording
-const MAX_RECORD_DURATION_MS = 10000; // 10 seconds
+
+const DEFAULT_MAX_RECORD_DURATION_MS = 10000; // 10 seconds fallback
+const MIN_RECORD_DURATION_SECONDS = 3;
+const MAX_RECORD_DURATION_SECONDS = 60;
+const STORAGE_KEY_MAX_DURATION_SECONDS = 'maxRecordDurationSeconds';
+
+function clampDurationSeconds(value) {
+    const seconds = Number.parseInt(value, 10);
+
+    if (Number.isNaN(seconds)) {
+        return DEFAULT_MAX_RECORD_DURATION_MS / 1000;
+    }
+
+    return Math.min(MAX_RECORD_DURATION_SECONDS, Math.max(MIN_RECORD_DURATION_SECONDS, seconds));
+}
+
+async function getMaxRecordDurationMs() {
+    try {
+        const settings = await chrome.storage.sync.get(STORAGE_KEY_MAX_DURATION_SECONDS);
+        const boundedSeconds = clampDurationSeconds(settings?.[STORAGE_KEY_MAX_DURATION_SECONDS]);
+        return boundedSeconds * 1000;
+    } catch (error) {
+        console.warn("YouTube Clip Recorder: Failed to load duration from storage, using default.", error);
+        return DEFAULT_MAX_RECORD_DURATION_MS;
+    }
+}
 
 function createRecordButton() {
     if (document.getElementById('yt-clip-recorder-button')) {
@@ -76,10 +101,11 @@ async function handleRecordButtonClick() {
             console.log("YouTube Clip Recorder: Start recording message sent.");
 
             // Set timeout for automatic stop
+            const maxRecordDurationMs = await getMaxRecordDurationMs();
             stopTimeoutId = setTimeout(() => {
                 console.log("YouTube Clip Recorder: Max duration reached, stopping automatically.");
                 handleRecordButtonClick(); // Call this function again to trigger the stop logic
-            }, MAX_RECORD_DURATION_MS);
+            }, maxRecordDurationMs);
 
         } catch (error) {
             console.error("YouTube Clip Recorder: Error starting recording.", error);

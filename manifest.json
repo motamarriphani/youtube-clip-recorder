@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "YouTube Clip Recorder",
   "version": "0.1.0",
-  "description": "Record short video clips (up to 10s) from YouTube videos.",
+  "description": "Record short video clips from YouTube videos.",
   "permissions": [
     "tabCapture",  // To capture video stream
     "scripting",   // To inject content script programmatically (though we'll use static injection here)
@@ -24,9 +24,8 @@
     }
   ],
   "action": {
-    // We'll add a popup later for settings/previews. For now, it's just an icon.
-    "default_title": "YouTube Clip Recorder"
-    // "default_popup": "popup.html" // Future addition
+    "default_title": "YouTube Clip Recorder",
+    "default_popup": "popup.html"
   },
   "icons": {
     // Replace with your actual icon paths if you have them
