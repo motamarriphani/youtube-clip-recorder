@@ -13,6 +13,7 @@ const OFFSCREEN_START_RECORDING = "start-recording";
 const OFFSCREEN_STOP_RECORDING = "stop-recording";
 const CLIP_URL_REVOKE_DELAY_MS = 30000;
 const PERSISTED_CLIP_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const INLINE_PREVIEW_BLOB_MAX_BYTES = 24 * 1024 * 1024;
 const PENDING_CLIPS_DB_NAME = "ytClipRecorder";
 const PENDING_CLIPS_DB_VERSION = 1;
 const PENDING_CLIPS_STORE_NAME = "pendingClips";
@@ -194,7 +195,8 @@ function normalizeStartRecordingError(error) {
     const rawMessage = String(error?.message || error || "Unknown recording error.");
     const lower = rawMessage.toLowerCase();
 
-    if (lower.includes("not been invoked for the current page")) {
+    if (lower.includes("not been invoked for the current page")
+        || lower.includes("has not been invoked for the current page")) {
         return "Capture permission is not active for this tab yet. Click the extension icon once on this YouTube tab, close the popup, then try REC Clip again.";
     }
 
@@ -203,6 +205,17 @@ function normalizeStartRecordingError(error) {
     }
 
     return rawMessage;
+}
+
+function isTabCaptureInvocationErrorMessage(message) {
+    const lower = String(message || "").toLowerCase();
+    return lower.includes("not been invoked for the current page")
+        || lower.includes("has not been invoked for the current page")
+        || lower.includes("capture permission is not active for this tab")
+        || lower.includes("permission is not active for this tab")
+        || lower.includes("activetab permission")
+        || lower.includes("chrome pages cannot be captured")
+        || lower.includes("cannot be captured");
 }
 
 function isRecordingActive() {
@@ -327,15 +340,20 @@ async function handleRecordingStop(targetTabId, recordingResult = {}) {
 
     try {
         if (typeof targetTabId === "number") {
+            const previewPayload = {
+                clipId,
+                url: previewUrl,
+                filename,
+                title: captureInfo.title,
+                timestamp,
+            };
+            if (blob.size <= INLINE_PREVIEW_BLOB_MAX_BYTES) {
+                previewPayload.blob = blob;
+            }
+
             await chrome.tabs.sendMessage(targetTabId, {
                 action: "clipReadyForPreview",
-                payload: {
-                    clipId,
-                    url: previewUrl,
-                    filename,
-                    title: captureInfo.title,
-                    timestamp,
-                },
+                payload: previewPayload,
             });
             console.log(`Background: Clip preview sent for ${filename}`);
         } else {
@@ -429,8 +447,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 });
                 sendResponse({ success: true });
             } catch (error) {
-                console.error("Background: Error starting recording:", error);
+                const rawMessage = String(error?.message || error || "");
                 const friendlyMessage = normalizeStartRecordingError(error);
+
+                if (isTabCaptureInvocationErrorMessage(rawMessage) || isTabCaptureInvocationErrorMessage(friendlyMessage)) {
+                    console.info("Background: Tab capture invocation not active; content script can use local fallback.");
+                    resetRecordingRuntimeState();
+                    sendResponse({ success: false, message: friendlyMessage, fallbackSuggested: true });
+                    return;
+                }
+
+                console.error("Background: Error starting recording:", error);
                 resetRecordingRuntimeState();
                 emitRecordingState(RECORDING_ERROR_EVENT, { message: friendlyMessage });
                 emitRecordingState(RECORDING_STOPPED_EVENT, { reason: "startFailed" });
@@ -485,6 +512,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return true;
     }
 
+    if (message.action === "getClipPreviewData") {
+        (async () => {
+            const clipId = message.payload?.clipId;
+            if (!clipId) {
+                sendResponse({ success: false, message: "Missing clip ID." });
+                return;
+            }
+
+            const clip = await getPendingClip(clipId);
+            if (!clip?.blob) {
+                sendResponse({ success: false, message: "Clip not found." });
+                return;
+            }
+
+            sendResponse({ success: true, blob: clip.blob, filename: clip.filename });
+        })().catch((error) => {
+            sendResponse({ success: false, message: error.message || "Failed to load clip preview data." });
+        });
+        return true;
+    }
+
+    if (message.action === "downloadBlob") {
+        (async () => {
+            await downloadBlob(message.payload);
+            sendResponse({ success: true });
+        })().catch((error) => {
+            sendResponse({ success: false, message: error.message || "Failed to download generated clip." });
+        });
+        return true;
+    }
+
     return false;
 });
 
@@ -511,6 +569,25 @@ async function saveClip(payload = {}) {
     } finally {
         setTimeout(() => URL.revokeObjectURL(downloadUrl), CLIP_URL_REVOKE_DELAY_MS);
         scheduleClipCleanup(clipId);
+    }
+}
+
+async function downloadBlob(payload = {}) {
+    const { blob, filename = "youtube_clip.webm", saveAs = false } = payload;
+    if (!blob || typeof blob.size !== "number") {
+        throw new Error("Missing blob payload for download.");
+    }
+
+    const downloadUrl = URL.createObjectURL(blob);
+    try {
+        const downloadId = await chrome.downloads.download({
+            url: downloadUrl,
+            filename,
+            saveAs,
+        });
+        console.log(`Background: Generated clip download started with ID: ${downloadId}`);
+    } finally {
+        setTimeout(() => URL.revokeObjectURL(downloadUrl), CLIP_URL_REVOKE_DELAY_MS);
     }
 }
 

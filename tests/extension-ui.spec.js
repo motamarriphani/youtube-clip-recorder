@@ -55,7 +55,6 @@ test('injects recorder controls on YouTube watch page', async ({}, testInfo) => 
 
   await expect(page.locator('.ytp-right-controls')).toBeVisible({ timeout: 20_000 });
   await expect(page.locator('#yt-clip-recorder-button')).toBeVisible({ timeout: 20_000 });
-  await expect(page.locator('#yt-clip-recorder-audio-toggle')).toBeVisible({ timeout: 20_000 });
 
   await context.close();
 });
@@ -68,15 +67,12 @@ test('reinjects controls if YouTube re-renders and removes them', async ({}, tes
   await maybeAcceptConsent(page);
 
   await expect(page.locator('#yt-clip-recorder-button')).toBeVisible({ timeout: 20_000 });
-  await expect(page.locator('#yt-clip-recorder-audio-toggle')).toBeVisible({ timeout: 20_000 });
 
   await page.evaluate(() => {
     document.getElementById('yt-clip-recorder-button')?.remove();
-    document.getElementById('yt-clip-recorder-audio-toggle')?.remove();
   });
 
   await expect(page.locator('#yt-clip-recorder-button')).toBeVisible({ timeout: 10_000 });
-  await expect(page.locator('#yt-clip-recorder-audio-toggle')).toBeVisible({ timeout: 10_000 });
 
   await context.close();
 });

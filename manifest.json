@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "YouTube Clip Recorder",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Record short video clips from YouTube videos.",
   "minimum_chrome_version": "116",
   "permissions": [

@@ -5,9 +5,10 @@ Chrome extension to capture short clips from the currently open YouTube watch pa
 ## What It Does
 
 - Adds a `REC Clip` button to the YouTube player controls.
-- Lets you optionally include tab audio in the recording.
+- Records clips with audio by default.
 - Automatically stops at a configurable max duration.
 - Shows a preview modal after recording.
+- Lets you choose download mode in preview: `with audio` or `without audio`.
 - Lets you `Save`, `Save As...`, or `Discard` before download.
 
 ## Why This Exists
@@ -19,13 +20,13 @@ YouTube has no built-in one-click clip export for local files. This extension ad
 ### 1. Content script (`content.js`)
 
 - Injects recording UI into YouTube player controls.
-- Reads user settings from Chrome storage.
 - Sends `startRecording` and `stopRecording` messages to the background service worker.
 - Displays the clip preview modal.
+- Exports a no-audio download variant on demand from the preview modal.
 
 ### 2. Background service worker (`background.js`)
 
-- Uses `chrome.tabCapture` to capture the active tab video (and optional audio).
+- Uses `chrome.tabCapture` to capture the active tab video and audio.
 - Uses `MediaRecorder` with best available codec support.
 - Stores clip metadata and blob references for preview/save flow.
 - Persists pending clips in IndexedDB so save/discard can still work across service worker restarts.
@@ -55,10 +56,10 @@ YouTube has no built-in one-click clip export for local files. This extension ad
 ## Usage
 
 1. Open a YouTube video (`/watch` page).
-2. Toggle `Audio` on/off next to the recorder button.
-3. Click `REC Clip` to start.
-4. Click `STOP` or wait for auto-stop at max duration.
-5. In preview modal, choose:
+2. Click `REC Clip` to start.
+3. Click `STOP` or wait for auto-stop at max duration.
+4. In preview modal, choose `Download with audio` ON/OFF.
+5. Then choose:
    - `Save` for direct download
    - `Save As...` to pick location/name
    - `Discard` to remove the clip
@@ -78,8 +79,8 @@ YouTube has no built-in one-click clip export for local files. This extension ad
 - Recorder button does not persist on non-watch pages.
 - Start/stop recording works repeatedly in one tab.
 - Auto-stop triggers at configured max duration.
-- Audio toggle changes whether tab audio is included.
 - Preview shows playable clip.
+- Download works in both modes: with audio and no-audio export.
 - `Save`, `Save As...`, and `Discard` all work.
 - Recording filename is valid on Windows.
 - Save/discard still works after service worker restart.
