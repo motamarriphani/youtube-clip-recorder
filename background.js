@@ -4,13 +4,26 @@ let recordedBlobs = [];
 let captureInfo = { title: "youtube_clip", timestamp: "00:00" }; // Store title/time
 
 const VIDEO_MIME_TYPE = 'video/webm;codecs=vp9'; // VP9 is generally good for web
-// const VIDEO_MIME_TYPE = 'video/mp4;codecs=h264'; // Alternative, might have less browser support for recording
+const RECORDING_STARTED_EVENT = "recordingStarted";
+const RECORDING_STOPPED_EVENT = "recordingStopped";
+const RECORDING_ERROR_EVENT = "recordingError";
+
+function emitRecordingState(type, payload = {}) {
+    chrome.runtime.sendMessage({ type, payload }).catch((error) => {
+        // Ignore if there are no listeners in some extension contexts.
+        console.debug(`Background: Unable to emit ${type}.`, error?.message || error);
+    });
+}
+
+function isRecordingActive() {
+    return Boolean(mediaRecorder && mediaRecorder.state === "recording");
+}
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // Use an async function here to allow 'await' and properly handle promises/sendResponse
     (async () => {
         if (message.action === "startRecording") {
-            if (mediaRecorder && mediaRecorder.state !== "inactive") {
+            if (isRecordingActive()) {
                 console.warn("Background: Recording already in progress.");
                 sendResponse({ success: false, message: "Already recording." });
                 return; // Indicate message handled (implicitly)
@@ -23,7 +36,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 // Important: Get the tab where the message came from
                 const targetTabId = sender.tab?.id;
                 if (!targetTabId) {
-                   throw new Error("Could not get sender tab ID.");
+                    throw new Error("Could not get sender tab ID.");
                 }
 
                 // Start tab capture
@@ -32,7 +45,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     video: true,
                     videoConstraints: {
                         mandatory: {
-                             // Request desired quality, browser will do its best
+                            // Request desired quality, browser will do its best
                             minWidth: 1280,
                             minHeight: 720,
                             maxWidth: 1920,
@@ -44,15 +57,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 console.log("Background: Tab capture started.");
 
                 // Check if stream is valid
-                 if (!mediaStream || mediaStream.getVideoTracks().length === 0) {
-                     throw new Error("Failed to get video stream from tabCapture.");
-                 }
+                if (!mediaStream || mediaStream.getVideoTracks().length === 0) {
+                    throw new Error("Failed to get video stream from tabCapture.");
+                }
+
+                mediaStream.getVideoTracks().forEach((track) => {
+                    track.onended = () => {
+                        console.warn("Background: Video track ended unexpectedly.");
+                        if (isRecordingActive()) {
+                            mediaRecorder.stop();
+                        } else {
+                            stopCaptureResources();
+                            emitRecordingState(RECORDING_STOPPED_EVENT, { reason: "streamEnded" });
+                        }
+                    };
+                });
 
                 // Clear previous blobs
                 recordedBlobs = [];
 
                 // Create MediaRecorder
-                 mediaRecorder = new MediaRecorder(mediaStream, { mimeType: VIDEO_MIME_TYPE });
+                mediaRecorder = new MediaRecorder(mediaStream, { mimeType: VIDEO_MIME_TYPE });
 
                 mediaRecorder.ondataavailable = (event) => {
                     if (event.data && event.data.size > 0) {
@@ -64,34 +89,41 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 mediaRecorder.onstop = handleRecordingStop; // Assign the stop handler
 
                 mediaRecorder.onerror = (event) => {
+                    const errorMessage = event.error?.message || "MediaRecorder error";
                     console.error("Background: MediaRecorder error:", event.error);
                     // Clean up resources on error too
                     stopCaptureResources();
+                    emitRecordingState(RECORDING_ERROR_EVENT, { message: errorMessage });
+                    emitRecordingState(RECORDING_STOPPED_EVENT, { reason: "recorderError" });
                 };
 
                 // Start recording
                 mediaRecorder.start(100); // Collect data in chunks (e.g., every 100ms)
                 console.log("Background: MediaRecorder started.");
+                emitRecordingState(RECORDING_STARTED_EVENT, { title: captureInfo.title, timestamp: captureInfo.timestamp });
                 sendResponse({ success: true }); // Signal success back to content script
 
             } catch (error) {
                 console.error("Background: Error starting tab capture or MediaRecorder:", error);
                 stopCaptureResources(); // Clean up if error occurs during setup
-                 sendResponse({ success: false, message: error.message });
+                emitRecordingState(RECORDING_ERROR_EVENT, { message: error.message });
+                emitRecordingState(RECORDING_STOPPED_EVENT, { reason: "startFailed" });
+                sendResponse({ success: false, message: error.message });
             }
 
         } else if (message.action === "stopRecording") {
-             console.log("Background: Received stopRecording message.");
-             if (mediaRecorder && mediaRecorder.state === "recording") {
-                 mediaRecorder.stop(); // This will trigger the 'onstop' event handler
-                 // stopCaptureResources() is called within handleRecordingStop after blobs are processed
-                 sendResponse({ success: true });
-             } else {
-                 console.warn("Background: Stop requested but recorder not active/found.");
-                 // Still try to clean up just in case stream exists without recorder
-                 stopCaptureResources();
-                 sendResponse({ success: false, message: "Recorder not active." });
-             }
+            console.log("Background: Received stopRecording message.");
+            if (isRecordingActive()) {
+                mediaRecorder.stop(); // This will trigger the 'onstop' event handler
+                // stopCaptureResources() is called within handleRecordingStop after blobs are processed
+                sendResponse({ success: true });
+            } else {
+                console.warn("Background: Stop requested but recorder not active/found.");
+                // Still try to clean up just in case stream exists without recorder
+                stopCaptureResources();
+                emitRecordingState(RECORDING_STOPPED_EVENT, { reason: "alreadyInactive" });
+                sendResponse({ success: false, message: "Recorder not active." });
+            }
         }
     })(); // Immediately invoke the async function
 
@@ -117,31 +149,37 @@ function handleRecordingStop() {
             filename: filename,
             // saveAs: true // Uncomment to prompt user for save location each time
         }).then(downloadId => {
-             console.log(`Background: Download started with ID: ${downloadId}`);
+            console.log(`Background: Download started with ID: ${downloadId}`);
             // Note: Can't easily revokeObjectURL here directly as download is async.
             // Browser usually handles cleanup, but for long-running extensions, management might be needed.
             // setTimeout(() => URL.revokeObjectURL(url), 60000); // Revoke after 1 min as fallback
         }).catch(error => {
             console.error("Background: Download failed:", error);
             URL.revokeObjectURL(url); // Clean up if download initiation failed
+            emitRecordingState(RECORDING_ERROR_EVENT, { message: error.message || "Download failed" });
         });
 
         // Clear blobs after processing
-         recordedBlobs = [];
+        recordedBlobs = [];
     } else {
         console.warn("Background: Recording stopped but no data blobs found.");
     }
 
     // Clean up stream/recorder resources AFTER processing blobs
     stopCaptureResources();
+    emitRecordingState(RECORDING_STOPPED_EVENT, { reason: "stopped" });
 }
 
 function stopCaptureResources() {
     if (mediaRecorder && mediaRecorder.state !== "inactive") {
         // If somehow stop wasn't called cleanly, try again.
-        try { mediaRecorder.stop(); } catch (e) { console.warn("Error trying to stop recorder during cleanup:", e); }
+        try {
+            mediaRecorder.stop();
+        } catch (e) {
+            console.warn("Error trying to stop recorder during cleanup:", e);
+        }
     }
-     if (mediaStream) {
+    if (mediaStream) {
         mediaStream.getTracks().forEach(track => track.stop());
         console.log("Background: MediaStream tracks stopped.");
     }
@@ -149,27 +187,5 @@ function stopCaptureResources() {
     mediaStream = null;
     console.log("Background: Capture resources released.");
 }
-
-// Add listeners for tab updates/removal to stop recording if the target tab changes/closes
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-    // Check if the tab being updated is the one we are capturing
-    // And if the URL significantly changed (navigated away) or it's loading
-    if (mediaRecorder && mediaRecorder.state === "recording") {
-         const capturingTabId = mediaRecorder?.stream?.getVideoTracks()[0]?.getSettings()?.displaySurface?.tabId;
-         // Note: reliably getting tab ID from stream isn't straightforward, might need to store it separately when starting
-         // Let's rely on stopping via content script's interval checker for now, or handle tab removal.
-    }
-});
-
-chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
-    // Check if the closed tab is the one being recorded
-    // Requires storing targetTabId when starting capture
-    // if (tabId === storedTargetTabId && mediaRecorder && mediaRecorder.state === "recording") {
-    //    console.log(`Background: Target tab ${tabId} closed, stopping recording.`);
-    //    mediaRecorder.stop(); // Trigger stop and cleanup
-    // }
-    // Simplified: For now, assume content script handles navigation away,
-    // and if the whole browser closes, things stop anyway.
-});
 
 console.log("Background Service Worker started.");
