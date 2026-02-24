@@ -69,10 +69,13 @@ async function handleRecordButtonClick() {
 
         try {
             // Send message to background script to start
-            await chrome.runtime.sendMessage({
+            const response = await chrome.runtime.sendMessage({
                 action: "startRecording",
                 payload: { title: videoTitle, timestamp: timestamp }
             });
+            if (!response?.success) {
+                throw new Error(response?.message || 'Failed to start recording.');
+            }
             console.log("YouTube Clip Recorder: Start recording message sent.");
 
             // Set timeout for automatic stop
@@ -106,7 +109,10 @@ async function handleRecordButtonClick() {
 
         try {
             // Send message to background script to stop
-            await chrome.runtime.sendMessage({ action: "stopRecording" });
+            const response = await chrome.runtime.sendMessage({ action: "stopRecording" });
+            if (!response?.success) {
+                throw new Error(response?.message || 'Failed to stop recording.');
+            }
             console.log("YouTube Clip Recorder: Stop recording message sent.");
             // Optional: Maybe disable button briefly while saving?
             recordButton.disabled = true;

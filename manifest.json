@@ -4,34 +4,26 @@
   "version": "0.1.0",
   "description": "Record short video clips (up to 10s) from YouTube videos.",
   "permissions": [
-    "tabCapture",  // To capture video stream
-    "scripting",   // To inject content script programmatically (though we'll use static injection here)
-    "downloads",   // To save the recorded clip
-    "storage"      // For saving settings later (like auto-download toggle)
+    "tabCapture",
+    "scripting",
+    "downloads",
+    "storage"
   ],
   "host_permissions": [
-    "*://*.youtube.com/*" // Allows the extension to run on YouTube
+    "*://*.youtube.com/*"
   ],
   "background": {
     "service_worker": "background.js"
   },
   "content_scripts": [
     {
-      "matches": ["*://*.youtube.com/watch*"], // Run only on video watch pages
+      "matches": ["*://*.youtube.com/watch*"],
       "js": ["content.js"],
       "css": ["style.css"],
-      "run_at": "document_idle" // Run after the page is mostly loaded
+      "run_at": "document_idle"
     }
   ],
   "action": {
-    // We'll add a popup later for settings/previews. For now, it's just an icon.
     "default_title": "YouTube Clip Recorder"
-    // "default_popup": "popup.html" // Future addition
-  },
-  "icons": {
-    // Replace with your actual icon paths if you have them
-    // "16": "icons/icon16.png",
-    // "48": "icons/icon48.png",
-    // "128": "icons/icon128.png"
   }
 }
