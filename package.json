@@ -1,0 +1,25 @@
+{
+  "name": "youtube-clip-recorder",
+  "version": "1.0.0",
+  "description": "Chrome extension to capture short clips from the currently open YouTube watch page.",
+  "main": "background.js",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "test:ui": "playwright test --ui"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/motamarriphani/youtube-clip-recorder.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/motamarriphani/youtube-clip-recorder/issues"
+  },
+  "homepage": "https://github.com/motamarriphani/youtube-clip-recorder#readme",
+  "devDependencies": {
+    "@playwright/test": "^1.58.2"
+  }
+}
