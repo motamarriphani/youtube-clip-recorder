@@ -12,6 +12,63 @@
     font-weight: bold;
 }
 
+#yt-clip-recorder-status {
+    display: none !important;
+    margin-left: 8px !important;
+    padding: 4px 8px !important;
+    border-radius: 999px !important;
+    background: rgba(255, 255, 255, 0.08);
+    color: #f1f3f4;
+    font-size: 11px !important;
+    letter-spacing: 0.2px;
+    align-items: center;
+    gap: 6px;
+    line-height: 1.2;
+    white-space: nowrap;
+    pointer-events: none;
+}
+
+#yt-clip-recorder-status.yt-clip-recorder-status-visible {
+    display: inline-flex !important;
+}
+
+.yt-clip-recorder-status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #8a8a8a;
+    flex: none;
+}
+
+#yt-clip-recorder-status.yt-clip-recorder-status-recording {
+    background: rgba(255, 67, 67, 0.18);
+}
+
+#yt-clip-recorder-status.yt-clip-recorder-status-recording .yt-clip-recorder-status-dot {
+    background: #ff4d4f;
+    animation: yt-clip-recorder-pulse 1.2s ease-in-out infinite;
+}
+
+#yt-clip-recorder-status.yt-clip-recorder-status-starting .yt-clip-recorder-status-dot,
+#yt-clip-recorder-status.yt-clip-recorder-status-stopping .yt-clip-recorder-status-dot,
+#yt-clip-recorder-status.yt-clip-recorder-status-finalizing .yt-clip-recorder-status-dot {
+    background: #fbbc04;
+}
+
+#yt-clip-recorder-status.yt-clip-recorder-status-error {
+    background: rgba(220, 38, 38, 0.25);
+}
+
+#yt-clip-recorder-status.yt-clip-recorder-status-error .yt-clip-recorder-status-dot {
+    background: #ef4444;
+}
+
+@keyframes yt-clip-recorder-pulse {
+    0% { transform: scale(1); opacity: 1; }
+    50% { transform: scale(1.25); opacity: 0.75; }
+    100% { transform: scale(1); opacity: 1; }
+}
+
 #yt-clip-preview-overlay {
     position: fixed;
     inset: 0;
@@ -91,6 +148,41 @@
     color: #8ab4f8;
 }
 
+.yt-clip-preview-status-info {
+    color: #8ab4f8;
+}
+
+.yt-clip-preview-status-warning {
+    color: #fbbc04;
+}
+
+.yt-clip-preview-status-error {
+    color: #ff7070;
+}
+
+.yt-clip-preview-status-success {
+    color: #7bd88f;
+}
+
+.yt-clip-preview-discard-confirm {
+    margin: 0 0 10px;
+    padding: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.yt-clip-preview-discard-confirm p {
+    margin: 0 0 8px;
+    font-size: 12px;
+    color: #e8eaed;
+}
+
+.yt-clip-preview-discard-actions {
+    display: flex;
+    gap: 8px;
+}
+
 .yt-clip-preview-actions {
     display: flex;
     gap: 8px;
@@ -115,6 +207,18 @@
 .yt-clip-save-as {
     background: #3ea6ff;
     color: #000;
+}
+
+.yt-clip-replay,
+.yt-clip-retry-preview,
+.yt-clip-discard-confirm-cancel {
+    background: #2f2f2f;
+    color: #fff;
+}
+
+.yt-clip-discard-confirm-yes {
+    background: #ef4444;
+    color: #fff;
 }
 
 .yt-clip-discard {
@@ -158,7 +262,8 @@
 #yt-clip-preview-overlay.yt-clip-preview-overlay-minimized .yt-clip-preview-modal video,
 #yt-clip-preview-overlay.yt-clip-preview-overlay-minimized .yt-clip-preview-filename,
 #yt-clip-preview-overlay.yt-clip-preview-overlay-minimized .yt-clip-download-audio-option,
-#yt-clip-preview-overlay.yt-clip-preview-overlay-minimized .yt-clip-preview-status {
+#yt-clip-preview-overlay.yt-clip-preview-overlay-minimized .yt-clip-preview-status,
+#yt-clip-preview-overlay.yt-clip-preview-overlay-minimized .yt-clip-preview-discard-confirm {
     display: none;
 }
 

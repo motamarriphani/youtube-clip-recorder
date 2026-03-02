@@ -1,6 +1,8 @@
 console.log("YouTube Clip Recorder: Content script loaded.");
 
 let recordButton = null;
+let recordingStatusChip = null;
+let recordingStatusText = null;
 let isRecording = false;
 let isTransitioning = false;
 let stopTimeoutId = null;
@@ -34,10 +36,36 @@ const INJECTION_HEARTBEAT_MS = 1000;
 const LOCAL_RECORDING_MODE = 'local';
 const BACKGROUND_RECORDING_MODE = 'background';
 const LOCAL_RECORDING_TIMESLICE_MS = 100;
+const RECORDING_TICK_MS = 250;
+const INLINE_ERROR_RESET_MS = 6500;
+const PREVIEW_UNSAVED_GUARD_MESSAGE = "You have an unsaved clip preview. Leave this page and discard it?";
+
+const RECORDING_STATE_IDLE = 'idle';
+const RECORDING_STATE_STARTING = 'starting';
+const RECORDING_STATE_RECORDING = 'recording';
+const RECORDING_STATE_STOPPING = 'stopping';
+const RECORDING_STATE_FINALIZING = 'finalizing';
+const RECORDING_STATE_ERROR = 'error';
 
 const RECORDING_STARTED_EVENT = "recordingStarted";
 const RECORDING_STOPPED_EVENT = "recordingStopped";
 const RECORDING_ERROR_EVENT = "recordingError";
+const RECORDING_STOP_REASON_RECORDER_ERROR = "recorderError";
+const RECORDING_STOP_REASON_START_FAILED = "startFailed";
+const RECORDING_STOP_REASON_FINALIZE_FAILED = "finalizeFailed";
+const CAPTURE_PERMISSION_INACTIVE_ERROR_CODE = "capture_permission_inactive";
+const CAPTURE_DENIED_ERROR_CODE = "capture_denied_by_user";
+const PREVIEW_LOAD_FAILED_ERROR_CODE = "preview_load_failed";
+const DOWNLOAD_FAILED_ERROR_CODE = "download_failed";
+const DOWNLOAD_CANCELLED_ERROR_CODE = "download_cancelled";
+const SAVE_PICKER_UNAVAILABLE_ERROR_CODE = "save_picker_unavailable";
+const NO_AUDIO_EXPORT_FAILED_ERROR_CODE = "no_audio_export_failed";
+
+let recordingTickerId = null;
+let recordingStartedAtMs = 0;
+let recordingMaxDurationMs = DEFAULT_MAX_RECORD_DURATION_MS;
+let recorderInlineErrorTimeoutId = null;
+let recorderUiState = RECORDING_STATE_IDLE;
 
 const VIDEO_MIME_CANDIDATES = [
     { type: 'video/webm;codecs=vp9,opus', extension: 'webm' },
@@ -105,6 +133,159 @@ function escapeHtml(value) {
         .replace(/'/g, "&#39;");
 }
 
+function formatDurationClock(totalSeconds) {
+    const safeSeconds = Math.max(0, Math.floor(totalSeconds || 0));
+    const minutes = Math.floor(safeSeconds / 60);
+    const seconds = safeSeconds % 60;
+    return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+function ensureRecordingStatusChip() {
+    if (recordingStatusChip && recordingStatusText && document.body.contains(recordingStatusChip)) {
+        return recordingStatusChip;
+    }
+
+    const existingChip = document.getElementById('yt-clip-recorder-status');
+    if (existingChip) {
+        recordingStatusChip = existingChip;
+        recordingStatusText = existingChip.querySelector('.yt-clip-recorder-status-text');
+        return existingChip;
+    }
+
+    const controlsRight = document.querySelector('.ytp-right-controls');
+    if (!controlsRight) {
+        return null;
+    }
+
+    const statusChip = document.createElement('span');
+    statusChip.id = 'yt-clip-recorder-status';
+    statusChip.className = 'yt-clip-recorder-status';
+    statusChip.setAttribute('aria-live', 'polite');
+    statusChip.innerHTML = `
+        <span class="yt-clip-recorder-status-dot" aria-hidden="true"></span>
+        <span class="yt-clip-recorder-status-text"></span>
+    `;
+
+    const anchor = getControlsInsertAnchor(controlsRight);
+    safeInsertIntoControls(controlsRight, statusChip, anchor);
+    recordingStatusChip = statusChip;
+    recordingStatusText = statusChip.querySelector('.yt-clip-recorder-status-text');
+    return statusChip;
+}
+
+function clearRecorderInlineErrorTimer() {
+    if (recorderInlineErrorTimeoutId) {
+        clearTimeout(recorderInlineErrorTimeoutId);
+        recorderInlineErrorTimeoutId = null;
+    }
+}
+
+function stopRecordingTicker() {
+    if (recordingTickerId) {
+        clearInterval(recordingTickerId);
+        recordingTickerId = null;
+    }
+}
+
+function renderRecordingTimer() {
+    if (recorderUiState !== RECORDING_STATE_RECORDING) {
+        return;
+    }
+
+    ensureRecordingStatusChip();
+    if (!recordingStatusText) {
+        return;
+    }
+
+    const elapsedSeconds = (Date.now() - recordingStartedAtMs) / 1000;
+    const maxSeconds = recordingMaxDurationMs / 1000;
+    const elapsedClock = formatDurationClock(elapsedSeconds);
+    const maxClock = formatDurationClock(maxSeconds);
+    recordingStatusText.textContent = `${elapsedClock} / ${maxClock}`;
+    if (recordButton && isRecording && !isTransitioning) {
+        recordButton.textContent = `STOP ${elapsedClock}`;
+        recordButton.title = `Recording ${elapsedClock} / ${maxClock}`;
+    }
+}
+
+function setRecorderStatus(state, message = '') {
+    recorderUiState = state;
+    const chip = ensureRecordingStatusChip();
+    if (!chip || !recordingStatusText) {
+        return;
+    }
+
+    chip.classList.remove(
+        'yt-clip-recorder-status-visible',
+        'yt-clip-recorder-status-recording',
+        'yt-clip-recorder-status-starting',
+        'yt-clip-recorder-status-stopping',
+        'yt-clip-recorder-status-finalizing',
+        'yt-clip-recorder-status-error'
+    );
+
+    if (state === RECORDING_STATE_IDLE) {
+        recordingStatusText.textContent = '';
+        if (recordButton && !isRecording && !isTransitioning) {
+            recordButton.title = 'Start clip recording';
+        }
+        return;
+    }
+
+    chip.classList.add('yt-clip-recorder-status-visible');
+
+    if (state === RECORDING_STATE_STARTING) {
+        chip.classList.add('yt-clip-recorder-status-starting');
+        recordingStatusText.textContent = message || 'Starting...';
+        return;
+    }
+
+    if (state === RECORDING_STATE_RECORDING) {
+        chip.classList.add('yt-clip-recorder-status-recording');
+        renderRecordingTimer();
+        return;
+    }
+
+    if (state === RECORDING_STATE_STOPPING) {
+        chip.classList.add('yt-clip-recorder-status-stopping');
+        recordingStatusText.textContent = message || 'Stopping...';
+        return;
+    }
+
+    if (state === RECORDING_STATE_FINALIZING) {
+        chip.classList.add('yt-clip-recorder-status-finalizing');
+        recordingStatusText.textContent = message || 'Finalizing clip...';
+        return;
+    }
+
+    if (state === RECORDING_STATE_ERROR) {
+        chip.classList.add('yt-clip-recorder-status-error');
+        recordingStatusText.textContent = message || 'Something went wrong.';
+    }
+}
+
+function startRecordingTicker(maxDurationMs) {
+    stopRecordingTicker();
+    clearRecorderInlineErrorTimer();
+    recordingStartedAtMs = Date.now();
+    recordingMaxDurationMs = Math.max(0, Number(maxDurationMs) || DEFAULT_MAX_RECORD_DURATION_MS);
+    setRecorderStatus(RECORDING_STATE_RECORDING);
+    recordingTickerId = setInterval(renderRecordingTimer, RECORDING_TICK_MS);
+}
+
+function showRecorderInlineError(message, resetDelayMs = INLINE_ERROR_RESET_MS) {
+    stopRecordingTicker();
+    clearRecorderInlineErrorTimer();
+    setRecorderStatus(RECORDING_STATE_ERROR, message || 'Something went wrong.');
+
+    recorderInlineErrorTimeoutId = setTimeout(() => {
+        recorderInlineErrorTimeoutId = null;
+        if (!isRecording && !isTransitioning) {
+            setRecorderStatus(RECORDING_STATE_IDLE);
+        }
+    }, resetDelayMs);
+}
+
 function isExtensionContextInvalidatedError(error) {
     const message = String(error?.message || error || "");
     return message.includes("Extension context invalidated");
@@ -154,6 +335,10 @@ function shouldUseLocalCaptureFallback(message) {
         || value.includes('activetab permission');
 }
 
+function shouldUseLocalCaptureFallbackForCode(code) {
+    return code === CAPTURE_PERMISSION_INACTIVE_ERROR_CODE;
+}
+
 function isCapturePermissionDeniedMessage(message) {
     const value = String(message || '').toLowerCase();
     return value.includes('permission denied')
@@ -161,6 +346,50 @@ function isCapturePermissionDeniedMessage(message) {
         || value.includes('permission dismissed')
         || value.includes('cancelled')
         || value.includes('canceled');
+}
+
+function toUserErrorMessage({ code, message }) {
+    const fallback = String(message || 'Something went wrong.');
+    if (code === CAPTURE_PERMISSION_INACTIVE_ERROR_CODE) {
+        return 'Capture permission is inactive. Click the extension icon on this YouTube tab once, close popup, and try REC again.';
+    }
+    if (code === CAPTURE_DENIED_ERROR_CODE) {
+        return 'Capture was denied. Please allow capture and try again.';
+    }
+    if (code === PREVIEW_LOAD_FAILED_ERROR_CODE) {
+        return 'Preview failed to load. Use Retry Preview or save directly.';
+    }
+    if (code === DOWNLOAD_FAILED_ERROR_CODE) {
+        if (fallback && fallback.toLowerCase() !== 'failed to download clip.' && fallback.toLowerCase() !== 'failed to start blob download.') {
+            return fallback;
+        }
+        return 'Save As failed. Please try again to choose location and filename.';
+    }
+    if (code === DOWNLOAD_CANCELLED_ERROR_CODE) {
+        return 'Save was cancelled.';
+    }
+    if (code === SAVE_PICKER_UNAVAILABLE_ERROR_CODE) {
+        return 'Save As is unavailable in this browser context.';
+    }
+    if (code === NO_AUDIO_EXPORT_FAILED_ERROR_CODE) {
+        return 'No-audio export failed. Try again or download with audio.';
+    }
+    return fallback;
+}
+
+function extractErrorDetails(source) {
+    if (!source) {
+        return { code: null, message: 'Something went wrong.' };
+    }
+
+    if (typeof source === 'object') {
+        return {
+            code: source.code || null,
+            message: String(source.message || source.error || 'Something went wrong.'),
+        };
+    }
+
+    return { code: null, message: String(source) };
 }
 
 function createPlayerCaptureStream(includeAudio) {
@@ -296,7 +525,9 @@ async function getBackgroundClipBlob(clipId) {
     }, { recoverOnInvalidation: false });
 
     if (!response?.success || !response.blob || typeof response.blob.size !== 'number') {
-        throw new Error(response?.message || 'Clip data is no longer available.');
+        const error = new Error(response?.message || 'Clip data is no longer available.');
+        error.code = response?.code || null;
+        throw error;
     }
 
     setBackgroundPreviewBlob(clipId, response.blob);
@@ -484,8 +715,71 @@ async function requestBlobDownload({ blob, filename, saveAs = false }) {
     }, { recoverOnInvalidation: false });
 
     if (!response?.success) {
-        throw new Error(response?.message || 'Failed to start blob download.');
+        const error = new Error(response?.message || 'Failed to start blob download.');
+        error.code = response?.code || DOWNLOAD_FAILED_ERROR_CODE;
+        throw error;
     }
+}
+
+function isSavePickerCancellationError(error) {
+    return error?.name === 'AbortError'
+        || String(error?.message || '').toLowerCase().includes('aborted');
+}
+
+function buildSavePickerTypes(filename = '', mimeType = 'video/webm') {
+    const extension = inferFileExtension(filename, 'webm');
+    const normalizedMime = normalizeMimeTypeForPicker(mimeType, extension);
+    const extensionWithDot = `.${extension}`;
+    return [{
+        description: 'Video clip',
+        accept: {
+            [normalizedMime]: [extensionWithDot],
+        },
+    }];
+}
+
+function normalizeMimeTypeForPicker(mimeType, extension = 'webm') {
+    const fallbackMime = extension === 'mp4' ? 'video/mp4' : 'video/webm';
+    const raw = String(mimeType || '').trim().toLowerCase();
+    if (!raw) {
+        return fallbackMime;
+    }
+
+    // showSaveFilePicker expects an essence MIME type (no codecs/params).
+    const essence = raw.split(';')[0].trim();
+    if (essence === 'video/webm' || essence === 'video/mp4') {
+        return essence;
+    }
+    return fallbackMime;
+}
+
+async function saveBlobWithSystemPicker({ blob, filename }) {
+    if (typeof window.showSaveFilePicker !== 'function') {
+        const unavailableError = new Error('Save As is unavailable in this browser context.');
+        unavailableError.code = SAVE_PICKER_UNAVAILABLE_ERROR_CODE;
+        throw unavailableError;
+    }
+
+    const fallbackFilename = filename || `youtube_clip_${Date.now()}.${inferFileExtension('', 'webm')}`;
+    let fileHandle = null;
+    try {
+        fileHandle = await window.showSaveFilePicker({
+            suggestedName: fallbackFilename,
+            types: buildSavePickerTypes(fallbackFilename, blob?.type || 'video/webm'),
+            excludeAcceptAllOption: false,
+        });
+    } catch (error) {
+        if (isSavePickerCancellationError(error)) {
+            const cancelledError = new Error('Save was cancelled.');
+            cancelledError.code = DOWNLOAD_CANCELLED_ERROR_CODE;
+            throw cancelledError;
+        }
+        throw error;
+    }
+
+    const writable = await fileHandle.createWritable();
+    await writable.write(blob);
+    await writable.close();
 }
 
 function cleanupLocalRecorderResources() {
@@ -548,10 +842,9 @@ async function saveLocalClip(clipId, saveAs = false) {
     }
 
     if (saveAs && clip.blob) {
-        await requestBlobDownload({
+        await saveBlobWithSystemPicker({
             blob: clip.blob,
             filename: clip.filename,
-            saveAs: true,
         });
     } else {
         triggerLocalDownload(clip.url, clip.filename);
@@ -560,13 +853,15 @@ async function saveLocalClip(clipId, saveAs = false) {
 }
 
 function finalizeLocalRecordingStop() {
+    setRecorderStatus(RECORDING_STATE_FINALIZING, 'Finalizing clip...');
     const chunks = [...localRecordedChunks];
     const metadata = localRecordingMeta;
     cleanupLocalRecorderResources();
     activeRecordingMode = null;
-    resetUIState();
+    resetRuntimeUiFlags();
 
     if (!chunks.length || !metadata) {
+        setRecorderStatus(RECORDING_STATE_IDLE);
         return;
     }
 
@@ -574,6 +869,7 @@ function finalizeLocalRecordingStop() {
     const fileExtension = metadata.fileExtension || 'webm';
     const blob = new Blob(chunks, { type: mimeType });
     if (blob.size === 0) {
+        setRecorderStatus(RECORDING_STATE_IDLE);
         return;
     }
 
@@ -586,6 +882,7 @@ function finalizeLocalRecordingStop() {
 
     localPendingClips.set(clipId, { url, filename, blob });
     showPreviewModal({ clipId, url, filename });
+    setRecorderStatus(RECORDING_STATE_IDLE);
 }
 
 async function startLocalRecording({ title, timestamp, includeAudio }) {
@@ -652,8 +949,8 @@ async function startLocalRecording({ title, timestamp, includeAudio }) {
         console.error('YouTube Clip Recorder: Local fallback recorder error.', event.error);
         cleanupLocalRecorderResources();
         activeRecordingMode = null;
-        resetUIState();
-        alert(`Error during local recording: ${message}`);
+        resetRuntimeUiFlags();
+        showRecorderInlineError(`Recording error: ${message}`);
     };
 
     localMediaRecorder.onstop = () => {
@@ -695,28 +992,39 @@ function clearTimers() {
     }
 }
 
-function setButtonState({ text, color = '', disabled = false }) {
+function setButtonState({ text, color = '', disabled = false, title }) {
     if (!recordButton) return;
     recordButton.textContent = text;
     recordButton.style.color = color;
     recordButton.disabled = disabled;
+    if (typeof title === 'string') {
+        recordButton.title = title;
+    }
 }
 
-function resetUIState() {
+function resetRuntimeUiFlags() {
     isRecording = false;
     isTransitioning = false;
     activeRecordingMode = null;
+    stopRecordingTicker();
     clearTimers();
-    setButtonState({ text: 'REC Clip', color: '', disabled: false });
+    setButtonState({ text: 'REC Clip', color: '', disabled: false, title: 'Start clip recording' });
+}
+
+function resetUIState() {
+    resetRuntimeUiFlags();
+    clearRecorderInlineErrorTimer();
+    setRecorderStatus(RECORDING_STATE_IDLE);
 }
 
 async function applyRecordingState() {
     isRecording = true;
     isTransitioning = false;
-    setButtonState({ text: 'STOP', color: 'red', disabled: false });
+    setButtonState({ text: 'STOP 00:00', color: 'red', disabled: false, title: 'Recording 00:00' });
 
     clearTimeout(stopTimeoutId);
     const maxDurationMs = await getMaxRecordDurationMs();
+    startRecordingTicker(maxDurationMs);
     stopTimeoutId = setTimeout(() => {
         console.log("YouTube Clip Recorder: Max duration reached, stopping automatically.");
         requestStopRecording();
@@ -729,7 +1037,8 @@ async function requestStopRecording() {
     }
 
     isTransitioning = true;
-    setButtonState({ text: 'Stopping...', color: '', disabled: true });
+    setButtonState({ text: 'Stopping...', color: '', disabled: true, title: 'Stopping recording' });
+    setRecorderStatus(RECORDING_STATE_STOPPING, 'Stopping...');
 
     try {
         if (activeRecordingMode === LOCAL_RECORDING_MODE) {
@@ -743,6 +1052,7 @@ async function requestStopRecording() {
 
         await sendRuntimeMessage({ action: "stopRecording" });
         console.log("YouTube Clip Recorder: Stop recording message sent.");
+        setRecorderStatus(RECORDING_STATE_FINALIZING, 'Finalizing clip...');
         reenableTimeoutId = setTimeout(() => {
             if (!isRecording) {
                 resetUIState();
@@ -750,8 +1060,8 @@ async function requestStopRecording() {
         }, 1200);
     } catch (error) {
         console.error("YouTube Clip Recorder: Error stopping recording.", error);
-        alert(`Error stopping recording: ${error.message}`);
-        resetUIState();
+        resetRuntimeUiFlags();
+        showRecorderInlineError(`Stop failed: ${error.message || 'Unknown error.'}`);
     }
 }
 
@@ -789,6 +1099,9 @@ function safeInsertIntoControls(controlsContainer, element, anchor) {
 function createRecordButton() {
     const existingButton = document.getElementById('yt-clip-recorder-button');
     if (existingButton) {
+        recordButton = existingButton;
+        recordingStatusChip = document.getElementById('yt-clip-recorder-status');
+        recordingStatusText = recordingStatusChip?.querySelector('.yt-clip-recorder-status-text') || null;
         return existingButton;
     }
 
@@ -806,10 +1119,11 @@ function createRecordButton() {
     button.style.padding = '5px 8px';
     button.onclick = handleRecordButtonClick;
 
+    ensureRecordingStatusChip();
     const anchor = getControlsInsertAnchor(controlsRight);
     safeInsertIntoControls(controlsRight, button, anchor);
 
-    console.log('YouTube Clip Recorder: Record button injected.');
+    console.log('YouTube Clip Recorder: Record controls injected.');
     return button;
 }
 
@@ -819,13 +1133,15 @@ async function handleRecordButtonClick() {
     const videoElement = document.querySelector('video.html5-main-video');
     if (!videoElement) {
         console.error("YouTube Clip Recorder: Video element not found.");
-        alert("Could not find the YouTube video element.");
+        resetRuntimeUiFlags();
+        showRecorderInlineError("Could not find the YouTube video element.");
         return;
     }
 
     if (!isRecording) {
         isTransitioning = true;
-        setButtonState({ text: 'Starting...', color: '', disabled: true });
+        setButtonState({ text: 'Starting...', color: '', disabled: true, title: 'Starting recording' });
+        setRecorderStatus(RECORDING_STATE_STARTING, 'Starting...');
 
         const videoTitle = document.title.replace(/ - YouTube$/, '');
         const currentTimeSeconds = Math.floor(videoElement.currentTime);
@@ -839,41 +1155,55 @@ async function handleRecordButtonClick() {
             }, { recoverOnInvalidation: false });
 
             if (!response?.success) {
-                if (response?.fallbackSuggested || shouldUseLocalCaptureFallback(response?.message)) {
+                const responseError = extractErrorDetails(response);
+                if (
+                    response?.fallbackSuggested
+                    || shouldUseLocalCaptureFallback(responseError.message)
+                    || shouldUseLocalCaptureFallbackForCode(responseError.code)
+                ) {
                     console.info('YouTube Clip Recorder: Falling back to local capture mode.');
                     await startLocalRecording({ title: videoTitle, timestamp, includeAudio });
                     return;
                 }
-                throw new Error(response?.message || "Failed to start recording.");
+                const runtimeError = new Error(responseError.message || "Failed to start recording.");
+                runtimeError.code = responseError.code || null;
+                throw runtimeError;
             }
 
             console.log("YouTube Clip Recorder: Start recording message sent.");
             activeRecordingMode = BACKGROUND_RECORDING_MODE;
             await applyRecordingState();
         } catch (error) {
-            const message = String(error?.message || error || "Unknown error.");
-            if (isExtensionContextInvalidatedError(error) || shouldUseLocalCaptureFallback(message)) {
+            const details = extractErrorDetails(error);
+            const message = details.message;
+            if (
+                isExtensionContextInvalidatedError(error)
+                || shouldUseLocalCaptureFallback(message)
+                || shouldUseLocalCaptureFallbackForCode(details.code)
+            ) {
                 try {
                     console.info('YouTube Clip Recorder: Runtime unavailable, using local capture fallback.');
                     await startLocalRecording({ title: videoTitle, timestamp, includeAudio });
                     return;
                 } catch (fallbackError) {
-                    const fallbackMessage = String(fallbackError?.message || fallbackError || "Unknown error.");
+                    const fallbackDetails = extractErrorDetails(fallbackError);
+                    const fallbackMessage = fallbackDetails.message;
                     if (isCapturePermissionDeniedMessage(fallbackMessage)) {
                         console.info('YouTube Clip Recorder: Capture selection was cancelled by user.');
-                        resetUIState();
+                        resetRuntimeUiFlags();
+                        showRecorderInlineError('Capture request was cancelled.');
                         return;
                     }
                     console.error("YouTube Clip Recorder: Local fallback start failed.", fallbackError);
-                    alert(`Error starting recording: ${fallbackMessage}`);
-                    resetUIState();
+                    resetRuntimeUiFlags();
+                    showRecorderInlineError(`Start failed: ${toUserErrorMessage(fallbackDetails)}`);
                     return;
                 }
             }
 
             console.error("YouTube Clip Recorder: Error starting recording.", error);
-            alert(`Error starting recording: ${message}`);
-            resetUIState();
+            resetRuntimeUiFlags();
+            showRecorderInlineError(`Start failed: ${toUserErrorMessage(details)}`);
         }
     } else {
         await requestStopRecording();
@@ -903,7 +1233,16 @@ function showPreviewModal({ clipId, url, filename, blob }) {
                 Download with audio
             </label>
             <p class="yt-clip-preview-status" aria-live="polite"></p>
+            <div class="yt-clip-preview-discard-confirm" hidden>
+                <p>Discard this clip permanently?</p>
+                <div class="yt-clip-preview-discard-actions">
+                    <button class="yt-clip-btn yt-clip-discard-confirm-yes">Discard</button>
+                    <button class="yt-clip-btn yt-clip-discard-confirm-cancel">Cancel</button>
+                </div>
+            </div>
             <div class="yt-clip-preview-actions">
+                <button class="yt-clip-btn yt-clip-replay">Replay</button>
+                <button class="yt-clip-btn yt-clip-retry-preview" hidden>Retry Preview</button>
                 <button class="yt-clip-btn yt-clip-save">Save</button>
                 <button class="yt-clip-btn yt-clip-save-as">Save As...</button>
                 <button class="yt-clip-btn yt-clip-discard">Discard</button>
@@ -915,10 +1254,44 @@ function showPreviewModal({ clipId, url, filename, blob }) {
     const statusEl = overlay.querySelector('.yt-clip-preview-status');
     const downloadAudioCheckbox = overlay.querySelector('.yt-clip-download-audio-checkbox');
     const minimizeButton = overlay.querySelector('.yt-clip-preview-minimize');
-    const actionButtons = [...overlay.querySelectorAll('.yt-clip-btn, .yt-clip-preview-close')];
+    const closeButton = overlay.querySelector('.yt-clip-preview-close');
+    const saveButton = overlay.querySelector('.yt-clip-save');
+    const saveAsButton = overlay.querySelector('.yt-clip-save-as');
+    const discardButton = overlay.querySelector('.yt-clip-discard');
+    const replayButton = overlay.querySelector('.yt-clip-replay');
+    const retryPreviewButton = overlay.querySelector('.yt-clip-retry-preview');
+    const discardConfirmContainer = overlay.querySelector('.yt-clip-preview-discard-confirm');
+    const discardConfirmYesButton = overlay.querySelector('.yt-clip-discard-confirm-yes');
+    const discardConfirmCancelButton = overlay.querySelector('.yt-clip-discard-confirm-cancel');
+    const actionButtons = [
+        saveButton,
+        saveAsButton,
+        discardButton,
+        replayButton,
+        retryPreviewButton,
+        closeButton,
+        minimizeButton,
+        discardConfirmYesButton,
+        discardConfirmCancelButton,
+    ].filter(Boolean);
     let isBusy = false;
 
-    const setPreviewBusy = (busy, statusText = '') => {
+    const setPreviewStatus = (statusText = '', type = 'info') => {
+        if (!statusEl) return;
+        statusEl.textContent = statusText;
+        statusEl.classList.remove(
+            'yt-clip-preview-status-info',
+            'yt-clip-preview-status-warning',
+            'yt-clip-preview-status-error',
+            'yt-clip-preview-status-success'
+        );
+        if (!statusText) {
+            return;
+        }
+        statusEl.classList.add(`yt-clip-preview-status-${type}`);
+    };
+
+    const setPreviewBusy = (busy, statusText = '', statusType = 'info') => {
         isBusy = busy;
         actionButtons.forEach((button) => {
             button.disabled = busy;
@@ -926,9 +1299,18 @@ function showPreviewModal({ clipId, url, filename, blob }) {
         if (downloadAudioCheckbox) {
             downloadAudioCheckbox.disabled = busy;
         }
-        if (statusEl) {
-            statusEl.textContent = statusText;
+        if (typeof statusText === 'string') {
+            setPreviewStatus(statusText, statusType);
+        } else if (busy) {
+            setPreviewStatus('Working...', 'info');
         }
+    };
+
+    const setDiscardConfirmationVisible = (visible) => {
+        if (!discardConfirmContainer) {
+            return;
+        }
+        discardConfirmContainer.hidden = !visible;
     };
 
     const setMinimized = (minimized) => {
@@ -943,17 +1325,17 @@ function showPreviewModal({ clipId, url, filename, blob }) {
         }
     };
 
-    minimizeButton?.addEventListener('click', (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        const currentlyMinimized = overlay.classList.contains('yt-clip-preview-overlay-minimized');
-        setMinimized(!currentlyMinimized);
-    });
+    const minimizePreviewUi = () => {
+        setDiscardConfirmationVisible(false);
+        setMinimized(true);
+        setPreviewStatus('Preview minimized. Use + to reopen.', 'info');
+    };
 
     const onDiscard = async () => {
         if (isBusy || !activePreviewClipId) return;
         const currentClipId = activePreviewClipId;
-        setPreviewBusy(true, 'Discarding preview...');
+        setPreviewBusy(true, 'Discarding preview...', 'warning');
+        setDiscardConfirmationVisible(false);
 
         if (isLocalClipId(currentClipId)) {
             discardLocalClip(currentClipId);
@@ -967,24 +1349,70 @@ function showPreviewModal({ clipId, url, filename, blob }) {
                 payload: { clipId: currentClipId },
             }, { recoverOnInvalidation: false });
             if (response?.success === false) {
-                throw new Error(response.message || 'Failed to discard clip.');
+                const error = new Error(response.message || 'Failed to discard clip.');
+                error.code = response.code || null;
+                throw error;
             }
             discardPreviewLocally();
         } catch (error) {
             console.error('YouTube Clip Recorder: Failed to discard clip.', error);
-            alert(`Error discarding clip: ${error.message || error}`);
-            setPreviewBusy(false, '');
+            setPreviewBusy(false);
+            setPreviewStatus(`Discard failed: ${toUserErrorMessage(extractErrorDetails(error))}`, 'error');
         }
     };
+
+    minimizeButton?.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const currentlyMinimized = overlay.classList.contains('yt-clip-preview-overlay-minimized');
+        if (currentlyMinimized) {
+            setMinimized(false);
+            if (!isBusy) {
+                setPreviewStatus('', 'info');
+            }
+            return;
+        }
+        minimizePreviewUi();
+    });
+
+    closeButton?.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        minimizePreviewUi();
+    });
 
     const handleSave = async (saveAs) => {
         if (isBusy || !activePreviewClipId) return;
         const currentClipId = activePreviewClipId;
         const withAudio = downloadAudioCheckbox ? downloadAudioCheckbox.checked : true;
+        setDiscardConfirmationVisible(false);
 
         if (withAudio) {
-            setPreviewBusy(true, saveAs ? 'Preparing Save As download...' : 'Preparing download...');
+            setPreviewBusy(true, saveAs ? 'Preparing Save As download...' : 'Preparing download...', 'info');
             try {
+                if (saveAs) {
+                    const sourceBlob = await getClipBlobForExport(currentClipId);
+                    await saveBlobWithSystemPicker({
+                        blob: sourceBlob,
+                        filename,
+                    });
+
+                    if (isLocalClipId(currentClipId)) {
+                        discardLocalClip(currentClipId);
+                    } else {
+                        const discardResponse = await sendRuntimeMessage({
+                            action: "discardClip",
+                            payload: { clipId: currentClipId },
+                        }, { recoverOnInvalidation: false });
+                        if (discardResponse?.success === false) {
+                            console.warn('YouTube Clip Recorder: Failed to discard saved background clip after Save As.');
+                        }
+                    }
+
+                    discardPreviewLocally();
+                    return;
+                }
+
                 if (isLocalClipId(currentClipId)) {
                     await saveLocalClip(currentClipId, saveAs);
                     discardPreviewLocally();
@@ -996,28 +1424,44 @@ function showPreviewModal({ clipId, url, filename, blob }) {
                     payload: { clipId: currentClipId, saveAs },
                 }, { recoverOnInvalidation: false });
                 if (!response?.success) {
-                    throw new Error(response?.message || 'Failed to start download.');
+                    const error = new Error(response?.message || 'Failed to start download.');
+                    error.code = response?.code || DOWNLOAD_FAILED_ERROR_CODE;
+                    throw error;
                 }
                 discardPreviewLocally();
             } catch (error) {
+                const details = extractErrorDetails(error);
+                if (details.code === DOWNLOAD_CANCELLED_ERROR_CODE) {
+                    console.info('YouTube Clip Recorder: Save action cancelled by user.');
+                    setPreviewBusy(false);
+                    setPreviewStatus(toUserErrorMessage(details), 'warning');
+                    return;
+                }
                 console.error('YouTube Clip Recorder: Failed to save clip.', error);
-                alert(`Error saving clip: ${error.message || error}`);
-                setPreviewBusy(false, '');
+                setPreviewBusy(false);
+                setPreviewStatus(`Download failed: ${toUserErrorMessage(details)}`, 'error');
             }
             return;
         }
 
-        setPreviewBusy(true, 'Removing audio and preparing download...');
+        setPreviewBusy(true, 'Removing audio and preparing download...', 'info');
         try {
             const sourceBlob = await getClipBlobForExport(currentClipId);
             const noAudioResult = await createNoAudioBlobFromSource(sourceBlob);
             const noAudioFilename = buildNoAudioFilename(filename, noAudioResult.extension);
 
-            await requestBlobDownload({
-                blob: noAudioResult.blob,
-                filename: noAudioFilename,
-                saveAs,
-            });
+            if (saveAs) {
+                await saveBlobWithSystemPicker({
+                    blob: noAudioResult.blob,
+                    filename: noAudioFilename,
+                });
+            } else {
+                await requestBlobDownload({
+                    blob: noAudioResult.blob,
+                    filename: noAudioFilename,
+                    saveAs: false,
+                });
+            }
 
             if (isLocalClipId(currentClipId)) {
                 discardLocalClip(currentClipId);
@@ -1033,25 +1477,81 @@ function showPreviewModal({ clipId, url, filename, blob }) {
 
             discardPreviewLocally();
         } catch (error) {
+            const details = extractErrorDetails(error);
+            if (details.code === DOWNLOAD_CANCELLED_ERROR_CODE) {
+                console.info('YouTube Clip Recorder: Save action cancelled by user.');
+                setPreviewBusy(false);
+                setPreviewStatus(toUserErrorMessage(details), 'warning');
+                return;
+            }
             console.error('YouTube Clip Recorder: Failed to export no-audio clip.', error);
-            alert(`Error exporting no-audio clip: ${error.message || error}`);
-            setPreviewBusy(false, '');
+            setPreviewBusy(false);
+            setPreviewStatus(`No-audio export failed: ${toUserErrorMessage(details)}`, 'error');
         }
     };
 
-    overlay.querySelector('.yt-clip-save')?.addEventListener('click', async () => {
+    saveButton?.addEventListener('click', async () => {
         await handleSave(false);
     });
 
-    overlay.querySelector('.yt-clip-save-as')?.addEventListener('click', async () => {
+    saveAsButton?.addEventListener('click', async () => {
         await handleSave(true);
     });
 
-    overlay.querySelector('.yt-clip-discard')?.addEventListener('click', onDiscard);
-    overlay.querySelector('.yt-clip-preview-close')?.addEventListener('click', onDiscard);
+    discardButton?.addEventListener('click', () => {
+        if (isBusy) return;
+        const isMinimized = overlay.classList.contains('yt-clip-preview-overlay-minimized');
+        if (isMinimized) {
+            const shouldDiscardNow = window.confirm('Discard this clip permanently?');
+            if (shouldDiscardNow) {
+                onDiscard().catch((error) => {
+                    console.error('YouTube Clip Recorder: Failed to discard from minimized preview.', error);
+                });
+            }
+            return;
+        }
+        setDiscardConfirmationVisible(true);
+        setPreviewStatus('Confirm discard to permanently delete this clip.', 'warning');
+    });
+
+    discardConfirmYesButton?.addEventListener('click', onDiscard);
+    discardConfirmCancelButton?.addEventListener('click', () => {
+        if (isBusy) return;
+        setDiscardConfirmationVisible(false);
+        setPreviewStatus('', 'info');
+    });
+
+    replayButton?.addEventListener('click', async () => {
+        const previewVideo = overlay.querySelector('video');
+        if (!previewVideo || isBusy) return;
+        try {
+            previewVideo.pause();
+            previewVideo.currentTime = 0;
+            await previewVideo.play();
+        } catch (error) {
+            setPreviewStatus('Replay failed. Try Retry Preview.', 'warning');
+        }
+    });
+
+    retryPreviewButton?.addEventListener('click', async () => {
+        const previewVideo = overlay.querySelector('video');
+        if (!previewVideo || isBusy || isLocalClipId(clipId)) {
+            return;
+        }
+        setPreviewBusy(true, 'Retrying preview...', 'info');
+        const recovered = await hydrateBackgroundPreviewSource(clipId, previewVideo);
+        setPreviewBusy(false);
+        if (recovered) {
+            retryPreviewButton.hidden = true;
+            setPreviewStatus('', 'info');
+            return;
+        }
+        setPreviewStatus(toUserErrorMessage({ code: PREVIEW_LOAD_FAILED_ERROR_CODE }), 'error');
+    });
+
     overlay.addEventListener('click', (event) => {
         if (event.target === overlay && !overlay.classList.contains('yt-clip-preview-overlay-minimized')) {
-            onDiscard();
+            minimizePreviewUi();
         }
     });
 
@@ -1059,7 +1559,7 @@ function showPreviewModal({ clipId, url, filename, blob }) {
     if (previewVideo) {
         let initialPositionApplied = false;
         const applyInitialPreviewPosition = () => {
-            if (initialPositionApplied) {
+            if (initialPositionApplied || isBusy) {
                 return;
             }
             initialPositionApplied = true;
@@ -1093,9 +1593,20 @@ function showPreviewModal({ clipId, url, filename, blob }) {
                 }
             }
 
-            if (statusEl) {
-                statusEl.textContent = '';
-            }
+            setTimeout(() => {
+                if (!Number.isFinite(previewVideo.duration) || previewVideo.duration <= 0) {
+                    return;
+                }
+                if (previewVideo.currentTime >= Math.max(previewVideo.duration * 0.9, previewVideo.duration - 0.5)) {
+                    try {
+                        previewVideo.currentTime = 0;
+                    } catch (_) {
+                        // no-op
+                    }
+                }
+            }, 150);
+
+            setPreviewStatus('', 'info');
         };
 
         previewVideo.addEventListener('loadedmetadata', applyInitialPreviewPosition);
@@ -1103,19 +1614,35 @@ function showPreviewModal({ clipId, url, filename, blob }) {
 
         let recoveryAttempted = false;
         previewVideo.addEventListener('error', async () => {
-            if (recoveryAttempted || isLocalClipId(clipId)) {
+            if (isLocalClipId(clipId)) {
+                setPreviewStatus(toUserErrorMessage({ code: PREVIEW_LOAD_FAILED_ERROR_CODE }), 'error');
+                if (retryPreviewButton) {
+                    retryPreviewButton.hidden = false;
+                }
                 return;
             }
-            recoveryAttempted = true;
-            initialPositionApplied = false;
-            const recovered = await hydrateBackgroundPreviewSource(clipId, previewVideo);
-            if (!recovered) {
-                console.warn('YouTube Clip Recorder: Preview player failed to load clip source.');
+
+            if (!recoveryAttempted) {
+                recoveryAttempted = true;
+                initialPositionApplied = false;
+                const recovered = await hydrateBackgroundPreviewSource(clipId, previewVideo);
+                if (recovered) {
+                    if (retryPreviewButton) {
+                        retryPreviewButton.hidden = true;
+                    }
+                    return;
+                }
             }
+
+            setPreviewStatus(toUserErrorMessage({ code: PREVIEW_LOAD_FAILED_ERROR_CODE }), 'error');
+            if (retryPreviewButton) {
+                retryPreviewButton.hidden = false;
+            }
+            console.warn('YouTube Clip Recorder: Preview player failed to load clip source.');
         });
 
         if (!isLocalClipId(clipId) && (!blob || typeof blob.size !== 'number')) {
-            setPreviewBusy(true, 'Loading preview...');
+            setPreviewBusy(true, 'Loading preview...', 'info');
             hydrateBackgroundPreviewSource(clipId, previewVideo)
                 .finally(() => {
                     setPreviewBusy(false, '');
@@ -1156,6 +1683,24 @@ async function cleanupPreviewOnUnload() {
     }
 }
 
+function hasUnsavedMinimizedPreview() {
+    return Boolean(
+        activePreviewClipId
+        && previewModalEl
+        && previewModalEl.classList.contains('yt-clip-preview-overlay-minimized')
+    );
+}
+
+function handleUnsavedPreviewBeforeUnload(event) {
+    if (!hasUnsavedMinimizedPreview()) {
+        return undefined;
+    }
+
+    event.preventDefault();
+    event.returnValue = PREVIEW_UNSAVED_GUARD_MESSAGE;
+    return PREVIEW_UNSAVED_GUARD_MESSAGE;
+}
+
 chrome.runtime.onMessage.addListener((message) => {
     if (!message) return;
 
@@ -1165,17 +1710,29 @@ chrome.runtime.onMessage.addListener((message) => {
     }
 
     if (message.type === RECORDING_STARTED_EVENT) {
-        activeRecordingMode = BACKGROUND_RECORDING_MODE;
-        applyRecordingState();
+        if (!isRecording) {
+            activeRecordingMode = BACKGROUND_RECORDING_MODE;
+            applyRecordingState();
+        }
     } else if (message.type === RECORDING_STOPPED_EVENT) {
+        const stopReason = message.payload?.reason || '';
+        if (
+            stopReason === RECORDING_STOP_REASON_RECORDER_ERROR
+            || stopReason === RECORDING_STOP_REASON_START_FAILED
+            || stopReason === RECORDING_STOP_REASON_FINALIZE_FAILED
+        ) {
+            return;
+        }
         resetUIState();
     } else if (message.type === RECORDING_ERROR_EVENT) {
-        console.error('YouTube Clip Recorder: Background recording error.', message.payload?.message || message.payload);
-        resetUIState();
+        const details = extractErrorDetails(message.payload || {});
+        console.error('YouTube Clip Recorder: Background recording error.', details.message);
+        resetRuntimeUiFlags();
+        showRecorderInlineError(toUserErrorMessage(details));
     }
 });
 
-window.addEventListener('beforeunload', cleanupPreviewOnUnload);
+window.addEventListener('beforeunload', handleUnsavedPreviewBeforeUnload);
 window.addEventListener('pagehide', cleanupPreviewOnUnload);
 
 async function initialize() {
@@ -1205,8 +1762,9 @@ function ensureRecorderControlsInjected() {
     if (!isWatchPageUrl()) return;
 
     const hasButton = Boolean(document.getElementById('yt-clip-recorder-button'));
+    const hasStatusChip = Boolean(document.getElementById('yt-clip-recorder-status'));
     const hasControls = Boolean(document.querySelector('.ytp-right-controls'));
-    if (!hasButton && hasControls) {
+    if ((!hasButton || !hasStatusChip) && hasControls) {
         debouncedInitialize();
     }
 }
@@ -1235,9 +1793,15 @@ function handleRouteOrStateChange() {
     }
 
     const existingButton = document.getElementById('yt-clip-recorder-button');
+    const existingStatusChip = document.getElementById('yt-clip-recorder-status');
     if (existingButton) {
         existingButton.remove();
         recordButton = null;
+    }
+    if (existingStatusChip) {
+        existingStatusChip.remove();
+        recordingStatusChip = null;
+        recordingStatusText = null;
     }
 
     cleanupPreviewOnUnload();

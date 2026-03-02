@@ -77,6 +77,25 @@ test('reinjects controls if YouTube re-renders and removes them', async ({}, tes
   await context.close();
 });
 
+test('reinjects recorder status chip if YouTube re-renders and removes it', async ({}, testInfo) => {
+  const context = await launchExtensionContext(testInfo);
+  const page = context.pages()[0] || await context.newPage();
+
+  await page.goto(TEST_VIDEO_URL, { waitUntil: 'domcontentloaded' });
+  await maybeAcceptConsent(page);
+
+  await expect(page.locator('#yt-clip-recorder-button')).toBeVisible({ timeout: 20_000 });
+  await expect(page.locator('#yt-clip-recorder-status')).toHaveCount(1);
+
+  await page.evaluate(() => {
+    document.getElementById('yt-clip-recorder-status')?.remove();
+  });
+
+  await expect(page.locator('#yt-clip-recorder-status')).toHaveCount(1, { timeout: 10_000 });
+
+  await context.close();
+});
+
 test('popup loads settings controls and saves duration', async ({}, testInfo) => {
   const context = await launchExtensionContext(testInfo);
   const extensionId = await getExtensionId(context);

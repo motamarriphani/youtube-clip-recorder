@@ -7,7 +7,62 @@
     body {
       font-family: Arial, sans-serif;
       margin: 12px;
-      min-width: 220px;
+      min-width: 300px;
+      color: #111827;
+      background: #ffffff;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: 16px;
+    }
+
+    h2 {
+      margin: 12px 0 8px;
+      font-size: 13px;
+      color: #374151;
+    }
+
+    .card {
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 10px;
+      margin-bottom: 10px;
+      background: #f9fafb;
+    }
+
+    .steps {
+      margin: 0;
+      padding-left: 18px;
+      font-size: 12px;
+      line-height: 1.45;
+      color: #1f2937;
+    }
+
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    #readiness {
+      font-size: 12px;
+      line-height: 1.2;
+      font-weight: 600;
+    }
+
+    #readiness.ready {
+      color: #0f766e;
+    }
+
+    #readiness.warning {
+      color: #b45309;
+    }
+
+    #readiness.error {
+      color: #b42318;
     }
 
     label,
@@ -18,6 +73,10 @@
       margin-bottom: 8px;
     }
 
+    button {
+      cursor: pointer;
+    }
+
     #status {
       font-size: 12px;
       min-height: 16px;
@@ -26,19 +85,42 @@
   </style>
 </head>
 <body>
-  <label for="duration">Max recording duration</label>
-  <select id="duration">
-    <option value="3">3 seconds</option>
-    <option value="5">5 seconds</option>
-    <option value="10">10 seconds</option>
-    <option value="15">15 seconds</option>
-    <option value="20">20 seconds</option>
-    <option value="30">30 seconds</option>
-    <option value="45">45 seconds</option>
-    <option value="60">60 seconds</option>
-  </select>
-  <button id="save" type="button">Save</button>
-  <div id="status" aria-live="polite"></div>
+  <h1>YouTube Clip Recorder</h1>
+
+  <div class="card">
+    <h2>Quick Start</h2>
+    <ol class="steps">
+      <li>Open a YouTube watch page.</li>
+      <li>Click this extension icon once on that tab.</li>
+      <li>Press <strong>REC Clip</strong> on the player controls.</li>
+      <li>Stop recording and choose download with/without audio in preview.</li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <h2>Capture Readiness</h2>
+    <div class="row">
+      <div id="readiness" class="warning">Not checked</div>
+      <button id="checkReadiness" type="button">Check</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Settings</h2>
+    <label for="duration">Max recording duration</label>
+    <select id="duration">
+      <option value="3">3 seconds</option>
+      <option value="5">5 seconds</option>
+      <option value="10">10 seconds</option>
+      <option value="15">15 seconds</option>
+      <option value="20">20 seconds</option>
+      <option value="30">30 seconds</option>
+      <option value="45">45 seconds</option>
+      <option value="60">60 seconds</option>
+    </select>
+    <button id="save" type="button">Save</button>
+    <div id="status" aria-live="polite"></div>
+  </div>
 
   <script src="popup.js"></script>
 </body>

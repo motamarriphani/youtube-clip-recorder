@@ -17,6 +17,19 @@ const INLINE_PREVIEW_BLOB_MAX_BYTES = 24 * 1024 * 1024;
 const PENDING_CLIPS_DB_NAME = "ytClipRecorder";
 const PENDING_CLIPS_DB_VERSION = 1;
 const PENDING_CLIPS_STORE_NAME = "pendingClips";
+const ERROR_CODE_CAPTURE_PERMISSION_INACTIVE = "capture_permission_inactive";
+const ERROR_CODE_CAPTURE_DISALLOWED_PAGE = "capture_disallowed_page";
+const ERROR_CODE_CAPTURE_START_FAILED = "capture_start_failed";
+const ERROR_CODE_CAPTURE_STOP_FAILED = "capture_stop_failed";
+const ERROR_CODE_ALREADY_RECORDING = "already_recording";
+const ERROR_CODE_RECORDER_INACTIVE = "recorder_not_active";
+const ERROR_CODE_CLIP_NOT_FOUND = "clip_not_found";
+const ERROR_CODE_MISSING_CLIP_ID = "missing_clip_id";
+const ERROR_CODE_DOWNLOAD_FAILED = "download_failed";
+const ERROR_CODE_DOWNLOAD_CANCELLED = "download_cancelled";
+const ERROR_CODE_BLOB_MISSING = "blob_missing";
+const ERROR_CODE_READINESS_CHECK_FAILED = "readiness_check_failed";
+const ERROR_CODE_TAB_ID_MISSING = "tab_id_missing";
 
 const pendingClips = new Map();
 
@@ -191,20 +204,75 @@ function emitRecordingState(type, payload = {}) {
     });
 }
 
+function inferFileExtension(filename = "", fallback = "webm") {
+    const match = String(filename).match(/\.([a-z0-9]+)$/i);
+    if (!match) {
+        return fallback;
+    }
+    return match[1].toLowerCase();
+}
+
+function buildFallbackDownloadFilename(filename = "") {
+    const extension = inferFileExtension(filename, "webm");
+    return `youtube_clip_${Date.now()}.${extension}`;
+}
+
+function isUserCancelledDownloadError(error) {
+    const message = String(error?.message || error || "").toLowerCase();
+    return message.includes("canceled")
+        || message.includes("cancelled")
+        || message.includes("interrupted");
+}
+
+function isRetryableSaveAsFilenameError(error) {
+    const message = String(error?.message || error || "").toLowerCase();
+    return message.includes("invalid filename")
+        || message.includes("invalid file name")
+        || message.includes("illegal characters")
+        || message.includes("could not create")
+        || message.includes("file name too long")
+        || message.includes("filename too long");
+}
+
+async function triggerDownload({ url, filename, saveAs }) {
+    const downloadOptions = { url, saveAs: Boolean(saveAs) };
+    if (filename) {
+        downloadOptions.filename = filename;
+    }
+    return chrome.downloads.download(downloadOptions);
+}
+
+function successResponse(payload = {}) {
+    return { success: true, ...payload };
+}
+
+function failureResponse(code, message, payload = {}) {
+    return { success: false, code, message, ...payload };
+}
+
 function normalizeStartRecordingError(error) {
     const rawMessage = String(error?.message || error || "Unknown recording error.");
     const lower = rawMessage.toLowerCase();
 
     if (lower.includes("not been invoked for the current page")
         || lower.includes("has not been invoked for the current page")) {
-        return "Capture permission is not active for this tab yet. Click the extension icon once on this YouTube tab, close the popup, then try REC Clip again.";
+        return {
+            code: ERROR_CODE_CAPTURE_PERMISSION_INACTIVE,
+            message: "Capture permission is not active for this tab yet. Click the extension icon once on this YouTube tab, close the popup, then try REC Clip again.",
+        };
     }
 
     if (lower.includes("chrome pages cannot be captured")) {
-        return "This page cannot be captured. Open a normal YouTube watch page (not chrome:// or extension pages) and try again.";
+        return {
+            code: ERROR_CODE_CAPTURE_DISALLOWED_PAGE,
+            message: "This page cannot be captured. Open a normal YouTube watch page (not chrome:// or extension pages) and try again.",
+        };
     }
 
-    return rawMessage;
+    return {
+        code: ERROR_CODE_CAPTURE_START_FAILED,
+        message: rawMessage,
+    };
 }
 
 function isTabCaptureInvocationErrorMessage(message) {
@@ -216,6 +284,22 @@ function isTabCaptureInvocationErrorMessage(message) {
         || lower.includes("activetab permission")
         || lower.includes("chrome pages cannot be captured")
         || lower.includes("cannot be captured");
+}
+
+function isYouTubeWatchUrl(url = "") {
+    try {
+        const parsed = new URL(url);
+        if (!parsed.hostname.includes("youtube.com")) {
+            return false;
+        }
+        const pathname = parsed.pathname || "";
+        return pathname === "/watch"
+            || pathname.startsWith("/embed/")
+            || pathname.startsWith("/shorts/")
+            || pathname.startsWith("/live/");
+    } catch (_) {
+        return false;
+    }
 }
 
 function isRecordingActive() {
@@ -373,7 +457,10 @@ async function handleOffscreenRecordingComplete(payload = {}) {
         emitRecordingState(RECORDING_STOPPED_EVENT, { reason: "stopped" });
     } catch (error) {
         console.error("Background: Failed while finalizing recording.", error);
-        emitRecordingState(RECORDING_ERROR_EVENT, { message: error.message || "Failed to finalize recording." });
+        emitRecordingState(RECORDING_ERROR_EVENT, {
+            code: ERROR_CODE_CAPTURE_STOP_FAILED,
+            message: error.message || "Failed to finalize recording.",
+        });
         emitRecordingState(RECORDING_STOPPED_EVENT, { reason: "finalizeFailed" });
     } finally {
         resetRecordingRuntimeState();
@@ -385,10 +472,11 @@ async function handleOffscreenRecordingComplete(payload = {}) {
 
 function handleOffscreenRecordingError(payload = {}) {
     const message = payload.message || "MediaRecorder error";
+    const code = payload.code || ERROR_CODE_CAPTURE_STOP_FAILED;
     console.error("Background: Offscreen recording error:", message);
 
     resetRecordingRuntimeState();
-    emitRecordingState(RECORDING_ERROR_EVENT, { message });
+    emitRecordingState(RECORDING_ERROR_EVENT, { code, message });
     emitRecordingState(RECORDING_STOPPED_EVENT, { reason: "recorderError" });
 
     closeOffscreenDocumentIfPresent().catch((error) => {
@@ -408,14 +496,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.action === "offscreenRecordingComplete") {
         handleOffscreenRecordingComplete(message.payload)
-            .then(() => sendResponse({ success: true }))
-            .catch((error) => sendResponse({ success: false, message: error.message }));
+            .then(() => sendResponse(successResponse()))
+            .catch((error) => sendResponse(failureResponse(ERROR_CODE_CAPTURE_STOP_FAILED, error.message || "Failed to finalize recording.")));
         return true;
     }
 
     if (message.action === "offscreenRecordingError") {
         handleOffscreenRecordingError(message.payload);
-        sendResponse({ success: true });
+        sendResponse(successResponse());
         return false;
     }
 
@@ -423,7 +511,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         (async () => {
             if (isRecordingActive()) {
                 console.warn("Background: Recording already in progress.");
-                sendResponse({ success: false, message: "Already recording." });
+                sendResponse(failureResponse(ERROR_CODE_ALREADY_RECORDING, "Already recording."));
                 return;
             }
 
@@ -445,23 +533,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     title: captureInfo.title,
                     timestamp: captureInfo.timestamp,
                 });
-                sendResponse({ success: true });
+                sendResponse(successResponse());
             } catch (error) {
                 const rawMessage = String(error?.message || error || "");
-                const friendlyMessage = normalizeStartRecordingError(error);
+                const normalized = normalizeStartRecordingError(error);
+                const friendlyMessage = normalized.message;
+                const errorCode = normalized.code;
 
                 if (isTabCaptureInvocationErrorMessage(rawMessage) || isTabCaptureInvocationErrorMessage(friendlyMessage)) {
                     console.info("Background: Tab capture invocation not active; content script can use local fallback.");
                     resetRecordingRuntimeState();
-                    sendResponse({ success: false, message: friendlyMessage, fallbackSuggested: true });
+                    sendResponse(failureResponse(
+                        ERROR_CODE_CAPTURE_PERMISSION_INACTIVE,
+                        friendlyMessage,
+                        { fallbackSuggested: true }
+                    ));
                     return;
                 }
 
                 console.error("Background: Error starting recording:", error);
                 resetRecordingRuntimeState();
-                emitRecordingState(RECORDING_ERROR_EVENT, { message: friendlyMessage });
+                emitRecordingState(RECORDING_ERROR_EVENT, { code: errorCode, message: friendlyMessage });
                 emitRecordingState(RECORDING_STOPPED_EVENT, { reason: "startFailed" });
-                sendResponse({ success: false, message: friendlyMessage });
+                sendResponse(failureResponse(errorCode, friendlyMessage));
             }
         })();
 
@@ -475,17 +569,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             if (!isRecordingActive()) {
                 console.warn("Background: Stop requested but recorder not active.");
                 emitRecordingState(RECORDING_STOPPED_EVENT, { reason: "alreadyInactive" });
-                sendResponse({ success: false, message: "Recorder not active." });
+                sendResponse(failureResponse(ERROR_CODE_RECORDER_INACTIVE, "Recorder not active."));
                 return;
             }
 
             try {
                 await stopOffscreenRecording();
-                sendResponse({ success: true });
+                sendResponse(successResponse());
             } catch (error) {
                 console.error("Background: Error stopping recording:", error);
                 handleOffscreenRecordingError({ message: error.message });
-                sendResponse({ success: false, message: error.message });
+                sendResponse(failureResponse(ERROR_CODE_CAPTURE_STOP_FAILED, error.message || "Failed to stop recording."));
             }
         })();
 
@@ -495,9 +589,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.action === "saveClip") {
         (async () => {
             await saveClip(message.payload);
-            sendResponse({ success: true });
+            sendResponse(successResponse());
         })().catch((error) => {
-            sendResponse({ success: false, message: error.message });
+            sendResponse(failureResponse(
+                error?.code || ERROR_CODE_DOWNLOAD_FAILED,
+                error?.message || "Failed to download clip."
+            ));
         });
         return true;
     }
@@ -505,9 +602,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.action === "discardClip") {
         (async () => {
             await discardClip(message.payload?.clipId);
-            sendResponse({ success: true });
+            sendResponse(successResponse());
         })().catch((error) => {
-            sendResponse({ success: false, message: error.message });
+            sendResponse(failureResponse(ERROR_CODE_CLIP_NOT_FOUND, error.message || "Failed to discard clip."));
         });
         return true;
     }
@@ -516,19 +613,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         (async () => {
             const clipId = message.payload?.clipId;
             if (!clipId) {
-                sendResponse({ success: false, message: "Missing clip ID." });
+                sendResponse(failureResponse(ERROR_CODE_MISSING_CLIP_ID, "Missing clip ID."));
                 return;
             }
 
             const clip = await getPendingClip(clipId);
             if (!clip?.blob) {
-                sendResponse({ success: false, message: "Clip not found." });
+                sendResponse(failureResponse(ERROR_CODE_CLIP_NOT_FOUND, "Clip not found."));
                 return;
             }
 
-            sendResponse({ success: true, blob: clip.blob, filename: clip.filename });
+            sendResponse(successResponse({ blob: clip.blob, filename: clip.filename }));
         })().catch((error) => {
-            sendResponse({ success: false, message: error.message || "Failed to load clip preview data." });
+            sendResponse(failureResponse(ERROR_CODE_CLIP_NOT_FOUND, error.message || "Failed to load clip preview data."));
         });
         return true;
     }
@@ -536,9 +633,51 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.action === "downloadBlob") {
         (async () => {
             await downloadBlob(message.payload);
-            sendResponse({ success: true });
+            sendResponse(successResponse());
         })().catch((error) => {
-            sendResponse({ success: false, message: error.message || "Failed to download generated clip." });
+            sendResponse(failureResponse(
+                error?.code || ERROR_CODE_DOWNLOAD_FAILED,
+                error?.message || "Failed to download generated clip."
+            ));
+        });
+        return true;
+    }
+
+    if (message.action === "getCaptureReadiness") {
+        (async () => {
+            const tabId = message.payload?.tabId;
+            const pageUrl = message.payload?.pageUrl || "";
+
+            if (!tabId || typeof tabId !== "number") {
+                sendResponse(failureResponse(ERROR_CODE_TAB_ID_MISSING, "Open a YouTube tab and click Check again."));
+                return;
+            }
+
+            if (!isYouTubeWatchUrl(pageUrl)) {
+                sendResponse(successResponse({
+                    ready: false,
+                    code: ERROR_CODE_CAPTURE_DISALLOWED_PAGE,
+                    message: "Open a YouTube watch page first, then check readiness again.",
+                }));
+                return;
+            }
+
+            try {
+                await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
+                sendResponse(successResponse({
+                    ready: true,
+                    message: "Ready for recording on this tab.",
+                }));
+            } catch (error) {
+                const normalized = normalizeStartRecordingError(error);
+                sendResponse(successResponse({
+                    ready: false,
+                    code: normalized.code || ERROR_CODE_READINESS_CHECK_FAILED,
+                    message: normalized.message || "Capture is not ready yet.",
+                }));
+            }
+        })().catch((error) => {
+            sendResponse(failureResponse(ERROR_CODE_READINESS_CHECK_FAILED, error.message || "Could not check capture readiness."));
         });
         return true;
     }
@@ -551,41 +690,119 @@ async function saveClip(payload = {}) {
     const clip = await getPendingClip(clipId);
     if (!clip || !clip.blob) {
         console.warn("Background: saveClip requested for missing clip", clipId);
-        return;
+        const error = new Error("Clip not found.");
+        error.code = ERROR_CODE_CLIP_NOT_FOUND;
+        throw error;
     }
 
     const downloadUrl = URL.createObjectURL(clip.blob);
 
+    let downloadStarted = false;
     try {
-        const downloadId = await chrome.downloads.download({
+        let downloadId = await triggerDownload({
             url: downloadUrl,
             filename: clip.filename,
             saveAs,
         });
+        if (!downloadId && saveAs) {
+            throw new Error("Download dialog was cancelled.");
+        }
+        if (!downloadId) {
+            throw new Error("Chrome did not start the download.");
+        }
+        downloadStarted = true;
         console.log(`Background: Download started with ID: ${downloadId}`);
     } catch (error) {
+        if (isUserCancelledDownloadError(error)) {
+            const cancelError = new Error("Save was cancelled.");
+            cancelError.code = ERROR_CODE_DOWNLOAD_CANCELLED;
+            throw cancelError;
+        }
+
+        if (saveAs && isRetryableSaveAsFilenameError(error)) {
+            try {
+                const fallbackFilename = buildFallbackDownloadFilename(clip.filename);
+                const retryDownloadId = await triggerDownload({
+                    url: downloadUrl,
+                    filename: fallbackFilename,
+                    saveAs: true,
+                });
+                if (retryDownloadId) {
+                    downloadStarted = true;
+                    console.warn(`Background: Save As filename rejected, used fallback name: ${fallbackFilename}`);
+                    return;
+                }
+            } catch (retryError) {
+                if (isUserCancelledDownloadError(retryError)) {
+                    const cancelError = new Error("Save was cancelled.");
+                    cancelError.code = ERROR_CODE_DOWNLOAD_CANCELLED;
+                    throw cancelError;
+                }
+                console.warn("Background: Save As retry with fallback filename failed.", retryError);
+            }
+        }
+
         console.error("Background: Failed to download clip", error);
-        throw error;
+        const downloadError = new Error(error?.message || "Failed to download clip.");
+        downloadError.code = ERROR_CODE_DOWNLOAD_FAILED;
+        throw downloadError;
     } finally {
         setTimeout(() => URL.revokeObjectURL(downloadUrl), CLIP_URL_REVOKE_DELAY_MS);
-        scheduleClipCleanup(clipId);
+        if (downloadStarted) {
+            scheduleClipCleanup(clipId);
+        }
     }
 }
 
 async function downloadBlob(payload = {}) {
     const { blob, filename = "youtube_clip.webm", saveAs = false } = payload;
     if (!blob || typeof blob.size !== "number") {
-        throw new Error("Missing blob payload for download.");
+        const error = new Error("Missing blob payload for download.");
+        error.code = ERROR_CODE_BLOB_MISSING;
+        throw error;
     }
 
     const downloadUrl = URL.createObjectURL(blob);
     try {
-        const downloadId = await chrome.downloads.download({
+        let downloadId = await triggerDownload({
             url: downloadUrl,
             filename,
             saveAs,
         });
+        if (!downloadId && saveAs) {
+            throw new Error("Download dialog was cancelled.");
+        }
+        if (!downloadId) {
+            throw new Error("Chrome did not start the download.");
+        }
         console.log(`Background: Generated clip download started with ID: ${downloadId}`);
+    } catch (error) {
+        if (isUserCancelledDownloadError(error)) {
+            const cancelError = new Error("Save was cancelled.");
+            cancelError.code = ERROR_CODE_DOWNLOAD_CANCELLED;
+            throw cancelError;
+        }
+
+        if (saveAs && isRetryableSaveAsFilenameError(error)) {
+            try {
+                const fallbackFilename = buildFallbackDownloadFilename(filename);
+                const retryDownloadId = await triggerDownload({
+                    url: downloadUrl,
+                    filename: fallbackFilename,
+                    saveAs: true,
+                });
+                if (retryDownloadId) {
+                    console.warn(`Background: Blob Save As filename rejected, used fallback name: ${fallbackFilename}`);
+                    return;
+                }
+            } catch (retryError) {
+                console.warn("Background: Blob Save As retry with fallback filename failed.", retryError);
+            }
+        }
+
+        const downloadError = new Error(error?.message || "Failed to download generated clip.");
+        downloadError.code = ERROR_CODE_DOWNLOAD_FAILED;
+        throw downloadError;
     } finally {
         setTimeout(() => URL.revokeObjectURL(downloadUrl), CLIP_URL_REVOKE_DELAY_MS);
     }
