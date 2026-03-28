@@ -30,6 +30,22 @@ const ERROR_CODE_DOWNLOAD_CANCELLED = "download_cancelled";
 const ERROR_CODE_BLOB_MISSING = "blob_missing";
 const ERROR_CODE_READINESS_CHECK_FAILED = "readiness_check_failed";
 const ERROR_CODE_TAB_ID_MISSING = "tab_id_missing";
+const STORAGE_KEY_RECORDING_QUALITY_PRESET = "recordingQualityPreset";
+const STORAGE_KEY_RECORDING_FPS_PRESET = "recordingFpsPreset";
+const STORAGE_KEY_MAX_DURATION_SECONDS = "maxRecordDurationSeconds";
+const DEFAULT_RECORDING_QUALITY_PRESET = "high";
+const DEFAULT_RECORDING_FPS_PRESET = "60";
+const DEFAULT_MAX_RECORD_DURATION_SECONDS = 10;
+const MIN_RECORD_DURATION_SECONDS = 3;
+const MAX_RECORD_DURATION_SECONDS = 60;
+const RECORDING_QUALITY_PRESETS = {
+    balanced: { label: "Balanced 720p" },
+    high: { label: "High 1080p" },
+};
+const RECORDING_FPS_PRESETS = {
+    30: { label: "30 fps" },
+    60: { label: "60 fps" },
+};
 
 const pendingClips = new Map();
 
@@ -242,6 +258,15 @@ async function triggerDownload({ url, filename, saveAs }) {
     return chrome.downloads.download(downloadOptions);
 }
 
+async function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error || new Error("Failed to read blob as data URL."));
+        reader.readAsDataURL(blob);
+    });
+}
+
 function successResponse(payload = {}) {
     return { success: true, ...payload };
 }
@@ -306,6 +331,28 @@ function isRecordingActive() {
     return isRecording;
 }
 
+function normalizeRecordingQualityPreset(value) {
+    return RECORDING_QUALITY_PRESETS[value] ? value : DEFAULT_RECORDING_QUALITY_PRESET;
+}
+
+function normalizeRecordingFpsPreset(value) {
+    return RECORDING_FPS_PRESETS[value] ? String(value) : DEFAULT_RECORDING_FPS_PRESET;
+}
+
+function clampDurationSeconds(value) {
+    const seconds = Number.parseInt(value, 10);
+    if (Number.isNaN(seconds)) {
+        return DEFAULT_MAX_RECORD_DURATION_SECONDS;
+    }
+    return Math.min(MAX_RECORD_DURATION_SECONDS, Math.max(MIN_RECORD_DURATION_SECONDS, seconds));
+}
+
+function describeRecordingProfile(profile = {}) {
+    const qualityPreset = normalizeRecordingQualityPreset(profile.qualityPreset);
+    const fpsPreset = normalizeRecordingFpsPreset(profile.fpsPreset);
+    return `${RECORDING_QUALITY_PRESETS[qualityPreset].label} / ${RECORDING_FPS_PRESETS[fpsPreset].label}`;
+}
+
 function resetRecordingRuntimeState() {
     isRecording = false;
     recordingTabId = null;
@@ -365,12 +412,13 @@ async function sendOffscreenMessage(type, payload = {}) {
     });
 }
 
-async function startOffscreenRecording(targetTabId, includeAudio) {
+async function startOffscreenRecording(targetTabId, includeAudio, recordingProfile) {
     const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId });
 
     const response = await sendOffscreenMessage(OFFSCREEN_START_RECORDING, {
         streamId,
         includeAudio,
+        recordingProfile,
     });
 
     if (!response?.success) {
@@ -379,6 +427,7 @@ async function startOffscreenRecording(targetTabId, includeAudio) {
 
     currentMimeType = response.mimeType || "video/webm";
     currentFileExtension = response.fileExtension || "webm";
+    return response;
 }
 
 async function stopOffscreenRecording() {
@@ -404,14 +453,12 @@ async function handleRecordingStop(targetTabId, recordingResult = {}) {
     const safeTimestamp = sanitizeFilenamePart(timestamp, "00_00");
     const audioSuffix = captureInfo.includeAudio ? "_with-audio" : "";
     const filename = `${safeTitle}_clip_${safeTimestamp}${audioSuffix}.${fileExtension}`;
-    const previewUrl = URL.createObjectURL(blob);
     const clipId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const createdAt = Date.now();
 
     pendingClips.set(clipId, {
         filename,
         blob,
-        previewUrl,
         createdAt,
         mimeType,
     });
@@ -426,7 +473,6 @@ async function handleRecordingStop(targetTabId, recordingResult = {}) {
         if (typeof targetTabId === "number") {
             const previewPayload = {
                 clipId,
-                url: previewUrl,
                 filename,
                 title: captureInfo.title,
                 timestamp,
@@ -525,14 +571,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     throw new Error("Could not get sender tab ID.");
                 }
 
+                const settings = await chrome.storage.sync.get([
+                    STORAGE_KEY_RECORDING_QUALITY_PRESET,
+                    STORAGE_KEY_RECORDING_FPS_PRESET,
+                ]);
+                const recordingProfile = {
+                    qualityPreset: normalizeRecordingQualityPreset(settings?.[STORAGE_KEY_RECORDING_QUALITY_PRESET]),
+                    fpsPreset: normalizeRecordingFpsPreset(settings?.[STORAGE_KEY_RECORDING_FPS_PRESET]),
+                };
+
                 recordingTabId = targetTabId;
-                await startOffscreenRecording(targetTabId, includeAudio);
+                const startResponse = await startOffscreenRecording(targetTabId, includeAudio, recordingProfile);
                 isRecording = true;
 
                 emitRecordingState(RECORDING_STARTED_EVENT, {
                     title: captureInfo.title,
                     timestamp: captureInfo.timestamp,
+                    recordingProfile,
+                    fallbackNotice: startResponse?.fallbackNotice || null,
                 });
+                console.log(`Background: Using recording preset ${describeRecordingProfile(recordingProfile)}.`);
+                if (startResponse?.fallbackNotice) {
+                    console.warn(`Background: ${startResponse.fallbackNotice}`);
+                }
                 sendResponse(successResponse());
             } catch (error) {
                 const rawMessage = String(error?.message || error || "");
@@ -623,7 +684,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 return;
             }
 
-            sendResponse(successResponse({ blob: clip.blob, filename: clip.filename }));
+            const dataUrl = await blobToDataUrl(clip.blob);
+            sendResponse(successResponse({
+                dataUrl,
+                type: clip.blob.type || "video/webm",
+                filename: clip.filename,
+            }));
         })().catch((error) => {
             sendResponse(failureResponse(ERROR_CODE_CLIP_NOT_FOUND, error.message || "Failed to load clip preview data."));
         });
@@ -682,6 +748,38 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return true;
     }
 
+    if (message.action === "getRecorderSettings") {
+        (async () => {
+            const localSettings = await chrome.storage.local.get([
+                STORAGE_KEY_MAX_DURATION_SECONDS,
+                STORAGE_KEY_RECORDING_QUALITY_PRESET,
+                STORAGE_KEY_RECORDING_FPS_PRESET,
+            ]);
+            const syncSettings = await chrome.storage.sync.get([
+                STORAGE_KEY_MAX_DURATION_SECONDS,
+                STORAGE_KEY_RECORDING_QUALITY_PRESET,
+                STORAGE_KEY_RECORDING_FPS_PRESET,
+            ]);
+            const settings = {
+                [STORAGE_KEY_MAX_DURATION_SECONDS]:
+                    localSettings?.[STORAGE_KEY_MAX_DURATION_SECONDS] ?? syncSettings?.[STORAGE_KEY_MAX_DURATION_SECONDS],
+                [STORAGE_KEY_RECORDING_QUALITY_PRESET]:
+                    localSettings?.[STORAGE_KEY_RECORDING_QUALITY_PRESET] ?? syncSettings?.[STORAGE_KEY_RECORDING_QUALITY_PRESET],
+                [STORAGE_KEY_RECORDING_FPS_PRESET]:
+                    localSettings?.[STORAGE_KEY_RECORDING_FPS_PRESET] ?? syncSettings?.[STORAGE_KEY_RECORDING_FPS_PRESET],
+            };
+
+            sendResponse(successResponse({
+                maxRecordDurationSeconds: clampDurationSeconds(settings?.[STORAGE_KEY_MAX_DURATION_SECONDS]),
+                recordingQualityPreset: normalizeRecordingQualityPreset(settings?.[STORAGE_KEY_RECORDING_QUALITY_PRESET]),
+                recordingFpsPreset: normalizeRecordingFpsPreset(settings?.[STORAGE_KEY_RECORDING_FPS_PRESET]),
+            }));
+        })().catch((error) => {
+            sendResponse(failureResponse(ERROR_CODE_READINESS_CHECK_FAILED, error.message || "Could not load recorder settings."));
+        });
+        return true;
+    }
+
     return false;
 });
 
@@ -695,7 +793,7 @@ async function saveClip(payload = {}) {
         throw error;
     }
 
-    const downloadUrl = URL.createObjectURL(clip.blob);
+    const downloadUrl = await blobToDataUrl(clip.blob);
 
     let downloadStarted = false;
     try {
@@ -747,10 +845,6 @@ async function saveClip(payload = {}) {
         downloadError.code = ERROR_CODE_DOWNLOAD_FAILED;
         throw downloadError;
     } finally {
-        setTimeout(() => URL.revokeObjectURL(downloadUrl), CLIP_URL_REVOKE_DELAY_MS);
-        if (downloadStarted) {
-            scheduleClipCleanup(clipId);
-        }
     }
 }
 
@@ -762,7 +856,7 @@ async function downloadBlob(payload = {}) {
         throw error;
     }
 
-    const downloadUrl = URL.createObjectURL(blob);
+    const downloadUrl = await blobToDataUrl(blob);
     try {
         let downloadId = await triggerDownload({
             url: downloadUrl,
@@ -803,8 +897,6 @@ async function downloadBlob(payload = {}) {
         const downloadError = new Error(error?.message || "Failed to download generated clip.");
         downloadError.code = ERROR_CODE_DOWNLOAD_FAILED;
         throw downloadError;
-    } finally {
-        setTimeout(() => URL.revokeObjectURL(downloadUrl), CLIP_URL_REVOKE_DELAY_MS);
     }
 }
 
@@ -812,9 +904,6 @@ async function discardClip(clipId) {
     if (!clipId) return;
 
     const clip = pendingClips.get(clipId);
-    if (clip?.previewUrl) {
-        URL.revokeObjectURL(clip.previewUrl);
-    }
     pendingClips.delete(clipId);
 
     try {

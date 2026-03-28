@@ -10,12 +10,15 @@ Chrome extension to capture short clips from the currently open YouTube watch pa
 - Shows a recording status chip with elapsed/max time.
 - Mirrors elapsed recording time directly on the `STOP` button for stronger in-player feedback.
 - Shows a preview modal after recording.
+- Pauses the underlying YouTube player when preview opens so the clip can be reviewed cleanly.
 - Lets you choose download mode in preview: `with audio` or `without audio`.
+- Lets you export the same recorded clip in multiple quality and frame-rate variants before discarding it.
 - Lets you `Save`, `Save As...`, or `Discard` before download.
 - Supports minimizing the preview instead of forcing close/discard.
 - Uses native system picker for `Save As...` so you can choose location and filename each time.
 - Allows immediate discard from minimized preview via confirmation popup.
 - Includes a popup readiness check so users can validate capture state before recording.
+- Moves quality and frame-rate selection into the preview/export modal instead of popup settings.
 
 ## Why This Exists
 
@@ -28,7 +31,7 @@ YouTube has no built-in one-click clip export for local files. This extension ad
 - Injects recording UI into YouTube player controls.
 - Sends `startRecording` and `stopRecording` messages to the background service worker.
 - Displays the clip preview modal.
-- Exports a no-audio download variant on demand from the preview modal.
+- Exports quality/FPS variants and no-audio downloads on demand from the preview modal.
 
 ### 2. Background service worker (`background.js`)
 
@@ -41,8 +44,9 @@ YouTube has no built-in one-click clip export for local files. This extension ad
 ### 3. Popup settings (`popup.html`, `popup.js`)
 
 - Lets users choose maximum clip duration (`3s` to `60s`).
+- Keeps quality/FPS out of popup so export decisions happen in the preview modal.
 - Includes capture readiness check for the active tab.
-- Stores the setting in `chrome.storage.sync`.
+- Stores duration in both `chrome.storage.local` and `chrome.storage.sync` for reliability.
 
 ## Permissions
 
@@ -68,16 +72,23 @@ YouTube has no built-in one-click clip export for local files. This extension ad
 3. (Optional) In the popup, click `Check` under `Capture Readiness`.
 4. Click `REC Clip` to start.
 5. Click `STOP` or wait for auto-stop at max duration.
-6. In preview modal, keep `Download with audio` checked or uncheck it for no-audio export.
+6. In preview modal, choose export quality and frame rate, and keep `Download with audio` checked or uncheck it for no-audio export.
 7. Then choose:
    - `Save` for direct download
    - `Save As...` to open native file picker and choose location/name
    - `Discard` to remove the clip
+8. If needed, minimize the preview and continue watching while exports finish.
 
 ### Minimized Preview Discard
 
 - If preview is minimized and you click `Discard`, a popup confirmation appears immediately.
 - You can discard without reopening the preview window.
+
+### Reusable Export Tray
+
+- Saving a clip no longer removes it immediately from preview.
+- You can export the same recording multiple times with different quality/FPS or audio options.
+- Discard the clip when you are fully done with all downloads.
 
 ### Capture Fallback Behavior
 
@@ -103,8 +114,10 @@ YouTube has no built-in one-click clip export for local files. This extension ad
 - Auto-stop triggers at configured max duration.
 - Preview shows playable clip.
 - Preview can be minimized and restored.
+- Preview stays available after successful save/export for additional downloads.
 - Discard from minimized preview works via popup confirmation.
 - Download works in both modes: with audio and no-audio export.
+- Export quality and frame-rate options produce alternate download variants from the same clip.
 - `Save`, `Save As...`, and `Discard` all work.
 - Recording filename is valid on Windows.
 - Save/discard still works after service worker restart.
@@ -113,6 +126,7 @@ YouTube has no built-in one-click clip export for local files. This extension ad
 
 - Capture quality and available codecs depend on Chrome/OS support.
 - This records the rendered tab stream, not source media files.
+- Exported quality presets are generated from the recorded clip and browser-supported encoding paths.
 - Browser autoplay policies and protected content may affect outcomes.
 - Extension currently targets YouTube watch page UI and may need updates if YouTube changes control DOM structure.
 

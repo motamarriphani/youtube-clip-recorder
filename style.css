@@ -126,6 +126,30 @@
     word-break: break-all;
 }
 
+.yt-clip-export-options {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+    margin: 0 0 10px;
+}
+
+.yt-clip-export-field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 12px;
+    color: #d9d9d9;
+}
+
+.yt-clip-export-field select {
+    width: 100%;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 6px;
+    background: #1d1d1d;
+    color: #fff;
+    padding: 8px 10px;
+}
+
 .yt-clip-download-audio-option {
     display: inline-flex;
     align-items: center;

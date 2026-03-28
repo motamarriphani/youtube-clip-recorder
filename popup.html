@@ -66,11 +66,35 @@
     }
 
     label,
-    select,
     button {
       display: block;
       width: 100%;
       margin-bottom: 8px;
+    }
+
+    .duration-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    .duration-option {
+      border: 1px solid #d0d5dd;
+      border-radius: 8px;
+      background: #ffffff;
+      color: #111827;
+      padding: 8px 10px;
+      font-size: 13px;
+      cursor: pointer;
+      text-align: center;
+    }
+
+    .duration-option.is-active {
+      border-color: #2563eb;
+      background: #eff6ff;
+      color: #1d4ed8;
+      font-weight: 600;
     }
 
     button {
@@ -107,17 +131,17 @@
 
   <div class="card">
     <h2>Settings</h2>
-    <label for="duration">Max recording duration</label>
-    <select id="duration">
-      <option value="3">3 seconds</option>
-      <option value="5">5 seconds</option>
-      <option value="10">10 seconds</option>
-      <option value="15">15 seconds</option>
-      <option value="20">20 seconds</option>
-      <option value="30">30 seconds</option>
-      <option value="45">45 seconds</option>
-      <option value="60">60 seconds</option>
-    </select>
+    <label>Max recording duration</label>
+    <div id="durationOptions" class="duration-grid">
+      <button class="duration-option" data-seconds="3" type="button">3 seconds</button>
+      <button class="duration-option" data-seconds="5" type="button">5 seconds</button>
+      <button class="duration-option" data-seconds="10" type="button">10 seconds</button>
+      <button class="duration-option" data-seconds="15" type="button">15 seconds</button>
+      <button class="duration-option" data-seconds="20" type="button">20 seconds</button>
+      <button class="duration-option" data-seconds="30" type="button">30 seconds</button>
+      <button class="duration-option" data-seconds="45" type="button">45 seconds</button>
+      <button class="duration-option" data-seconds="60" type="button">60 seconds</button>
+    </div>
     <button id="save" type="button">Save</button>
     <div id="status" aria-live="polite"></div>
   </div>

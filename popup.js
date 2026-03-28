@@ -2,12 +2,15 @@ const DEFAULT_MAX_RECORD_DURATION_SECONDS = 10;
 const MIN_RECORD_DURATION_SECONDS = 3;
 const MAX_RECORD_DURATION_SECONDS = 60;
 const STORAGE_KEY_MAX_DURATION_SECONDS = 'maxRecordDurationSeconds';
+const DURATION_OPTIONS = [3, 5, 10, 15, 20, 30, 45, 60];
 
-const durationSelect = document.getElementById('duration');
+const durationOptionsContainer = document.getElementById('durationOptions');
+const durationOptionButtons = Array.from(document.querySelectorAll('.duration-option'));
 const saveButton = document.getElementById('save');
 const statusElement = document.getElementById('status');
 const readinessElement = document.getElementById('readiness');
 const checkReadinessButton = document.getElementById('checkReadiness');
+let selectedDurationSeconds = DEFAULT_MAX_RECORD_DURATION_SECONDS;
 
 function clampDurationSeconds(value) {
   const seconds = Number.parseInt(value, 10);
@@ -30,35 +33,42 @@ function setReadiness(message, tone = 'warning') {
   readinessElement.classList.add(tone);
 }
 
+function setSelectedDuration(seconds) {
+  selectedDurationSeconds = clampDurationSeconds(seconds);
+  durationOptionButtons.forEach((button) => {
+    const buttonSeconds = Number.parseInt(button.dataset.seconds || '', 10);
+    button.classList.toggle('is-active', buttonSeconds === selectedDurationSeconds);
+  });
+}
+
 async function loadSettings() {
   try {
-    const settings = await chrome.storage.sync.get(STORAGE_KEY_MAX_DURATION_SECONDS);
+    const localSettings = await chrome.storage.local.get(STORAGE_KEY_MAX_DURATION_SECONDS);
+    const syncSettings = await chrome.storage.sync.get(STORAGE_KEY_MAX_DURATION_SECONDS);
+    const settings = {
+      [STORAGE_KEY_MAX_DURATION_SECONDS]:
+        localSettings?.[STORAGE_KEY_MAX_DURATION_SECONDS] ?? syncSettings?.[STORAGE_KEY_MAX_DURATION_SECONDS],
+    };
     const seconds = clampDurationSeconds(settings?.[STORAGE_KEY_MAX_DURATION_SECONDS]);
-    durationSelect.value = String(seconds);
+    setSelectedDuration(seconds);
     setStatus('');
   } catch (error) {
-    console.error('Failed to load max duration setting.', error);
-    durationSelect.value = String(DEFAULT_MAX_RECORD_DURATION_SECONDS);
-    setStatus('Could not load saved setting.', true);
+    console.error('Failed to load saved settings.', error);
+    setSelectedDuration(DEFAULT_MAX_RECORD_DURATION_SECONDS);
+    setStatus('Could not load saved settings.', true);
   }
 }
 
 async function saveSettings() {
-  const selectedValue = durationSelect.value;
-  const seconds = clampDurationSeconds(selectedValue);
-
-  if (Number.parseInt(selectedValue, 10) !== seconds) {
-    durationSelect.value = String(seconds);
-    setStatus(`Duration must be between ${MIN_RECORD_DURATION_SECONDS}s and ${MAX_RECORD_DURATION_SECONDS}s.`, true);
-    return;
-  }
+  const seconds = clampDurationSeconds(selectedDurationSeconds);
 
   try {
+    await chrome.storage.local.set({ [STORAGE_KEY_MAX_DURATION_SECONDS]: seconds });
     await chrome.storage.sync.set({ [STORAGE_KEY_MAX_DURATION_SECONDS]: seconds });
     setStatus('Saved.');
   } catch (error) {
-    console.error('Failed to save max duration setting.', error);
-    setStatus('Could not save setting.', true);
+    console.error('Failed to save recording settings.', error);
+    setStatus('Could not save settings.', true);
   }
 }
 
@@ -123,6 +133,17 @@ async function checkReadiness() {
 }
 
 saveButton.addEventListener('click', saveSettings);
+durationOptionsContainer.addEventListener('click', (event) => {
+  const button = event.target.closest('.duration-option');
+  if (!button) {
+    return;
+  }
+  const seconds = Number.parseInt(button.dataset.seconds || '', 10);
+  if (!DURATION_OPTIONS.includes(seconds)) {
+    return;
+  }
+  setSelectedDuration(seconds);
+});
 checkReadinessButton.addEventListener('click', checkReadiness);
 document.addEventListener('DOMContentLoaded', async () => {
   await loadSettings();

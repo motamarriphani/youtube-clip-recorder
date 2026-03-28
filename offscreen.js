@@ -20,6 +20,32 @@ const VIDEO_MIME_CANDIDATES = [
     { type: "video/mp4;codecs=avc1.42E01E,mp4a.40.2", extension: "mp4" },
     { type: "video/mp4", extension: "mp4" },
 ];
+const DEFAULT_RECORDING_QUALITY_PRESET = "high";
+const DEFAULT_RECORDING_FPS_PRESET = "60";
+const RECORDING_QUALITY_PRESETS = {
+    balanced: {
+        label: "Balanced 720p",
+        width: 1280,
+        height: 720,
+        videoBitsPerSecond: {
+            30: 3500000,
+            60: 5000000,
+        },
+    },
+    high: {
+        label: "High 1080p",
+        width: 1920,
+        height: 1080,
+        videoBitsPerSecond: {
+            30: 6000000,
+            60: 9000000,
+        },
+    },
+};
+const RECORDING_FPS_PRESETS = {
+    30: { label: "30 fps", frameRate: 30 },
+    60: { label: "60 fps", frameRate: 60 },
+};
 
 function selectSupportedMimeType(includeAudio) {
     const compatibleType = VIDEO_MIME_CANDIDATES.find((candidate) => {
@@ -40,6 +66,86 @@ function selectSupportedMimeType(includeAudio) {
     }
 
     return { type: "", extension: "webm" };
+}
+
+function normalizeRecordingQualityPreset(value) {
+    return RECORDING_QUALITY_PRESETS[value] ? value : DEFAULT_RECORDING_QUALITY_PRESET;
+}
+
+function normalizeRecordingFpsPreset(value) {
+    return RECORDING_FPS_PRESETS[value] ? String(value) : DEFAULT_RECORDING_FPS_PRESET;
+}
+
+function resolveRecordingProfile(profile = {}) {
+    const qualityPreset = normalizeRecordingQualityPreset(profile.qualityPreset);
+    const fpsPreset = normalizeRecordingFpsPreset(profile.fpsPreset);
+    const quality = RECORDING_QUALITY_PRESETS[qualityPreset];
+    const fps = RECORDING_FPS_PRESETS[fpsPreset];
+
+    return {
+        qualityPreset,
+        fpsPreset,
+        quality,
+        fps,
+        width: quality.width,
+        height: quality.height,
+        maxFrameRate: fps.frameRate,
+        videoBitsPerSecond: quality.videoBitsPerSecond[fpsPreset] || quality.videoBitsPerSecond[DEFAULT_RECORDING_FPS_PRESET],
+    };
+}
+
+function buildStreamConstraints(streamId, includeAudio, recordingProfile) {
+    const profile = resolveRecordingProfile(recordingProfile);
+    return {
+        audio: includeAudio
+            ? {
+                mandatory: {
+                    chromeMediaSource: "tab",
+                    chromeMediaSourceId: streamId,
+                },
+            }
+            : false,
+        video: {
+            mandatory: {
+                chromeMediaSource: "tab",
+                chromeMediaSourceId: streamId,
+                minWidth: profile.width,
+                minHeight: profile.height,
+                maxWidth: profile.width,
+                maxHeight: profile.height,
+                maxFrameRate: profile.maxFrameRate,
+            },
+        },
+    };
+}
+
+function buildRecorderOptions(selectedMime, recordingProfile, includeAudio) {
+    const profile = resolveRecordingProfile(recordingProfile);
+    const recorderOptions = {};
+
+    if (selectedMime?.type) {
+        recorderOptions.mimeType = selectedMime.type;
+    }
+
+    if (profile.videoBitsPerSecond) {
+        recorderOptions.videoBitsPerSecond = profile.videoBitsPerSecond;
+    }
+
+    if (includeAudio) {
+        recorderOptions.audioBitsPerSecond = 128000;
+    }
+
+    return recorderOptions;
+}
+
+function isCapabilityError(error) {
+    const message = String(error?.message || error || "").toLowerCase();
+    return error?.name === "OverconstrainedError"
+        || message.includes("constraint")
+        || message.includes("frame rate")
+        || message.includes("unsupported")
+        || message.includes("not supported")
+        || message.includes("could not");
 }
 
 function stopTrackMonitor() {
@@ -110,30 +216,6 @@ async function notifyBackground(action, payload = {}) {
     }
 }
 
-function buildStreamConstraints(streamId, includeAudio) {
-    return {
-        audio: includeAudio
-            ? {
-                mandatory: {
-                    chromeMediaSource: "tab",
-                    chromeMediaSourceId: streamId,
-                },
-            }
-            : false,
-        video: {
-            mandatory: {
-                chromeMediaSource: "tab",
-                chromeMediaSourceId: streamId,
-                minWidth: 1280,
-                minHeight: 720,
-                maxWidth: 1920,
-                maxHeight: 1080,
-                maxFrameRate: 30,
-            },
-        },
-    };
-}
-
 async function emitRecordingComplete() {
     if (completionSent) {
         return;
@@ -164,7 +246,7 @@ async function emitRecordingError(message) {
     cleanupCaptureResources();
 }
 
-async function startRecording(payload = {}) {
+async function startRecordingWithProfile(payload = {}, recordingProfile) {
     if (mediaRecorder && mediaRecorder.state === "recording") {
         return { success: false, message: "Already recording." };
     }
@@ -183,7 +265,7 @@ async function startRecording(payload = {}) {
         };
     }
 
-    const recorderOptions = selectedMime.type ? { mimeType: selectedMime.type } : undefined;
+    const recorderOptions = buildRecorderOptions(selectedMime, recordingProfile, includeAudio);
 
     recordedChunks = [];
     currentMimeType = selectedMime.type || "video/webm";
@@ -191,7 +273,7 @@ async function startRecording(payload = {}) {
     completionSent = false;
 
     try {
-        mediaStream = await navigator.mediaDevices.getUserMedia(buildStreamConstraints(streamId, includeAudio));
+        mediaStream = await navigator.mediaDevices.getUserMedia(buildStreamConstraints(streamId, includeAudio, recordingProfile));
     } catch (error) {
         cleanupCaptureResources();
         return { success: false, message: error?.message || "Failed to get media stream." };
@@ -202,50 +284,91 @@ async function startRecording(payload = {}) {
         return { success: false, message: "Failed to get video stream from tab capture." };
     }
 
-    mediaRecorder = recorderOptions
-        ? new MediaRecorder(mediaStream, recorderOptions)
-        : new MediaRecorder(mediaStream);
+    try {
+        mediaRecorder = Object.keys(recorderOptions).length > 0
+            ? new MediaRecorder(mediaStream, recorderOptions)
+            : new MediaRecorder(mediaStream);
 
-    mediaRecorder.ondataavailable = (event) => {
-        if (event.data && event.data.size > 0) {
-            recordedChunks.push(event.data);
-        }
-    };
-
-    mediaRecorder.onerror = (event) => {
-        const errorMessage = event.error?.message || "MediaRecorder error";
-        emitRecordingError(errorMessage).catch((error) => {
-            console.warn("Offscreen: Failed to handle recorder error.", error);
-        });
-    };
-
-    mediaRecorder.onstop = () => {
-        emitRecordingComplete().catch((error) => {
-            console.warn("Offscreen: Failed to emit recording completion.", error);
-        });
-    };
-
-    mediaStream.getVideoTracks().forEach((track) => {
-        track.onended = () => {
-            if (mediaRecorder?.state === "recording") {
-                mediaRecorder.stop();
-                return;
+        mediaRecorder.ondataavailable = (event) => {
+            if (event.data && event.data.size > 0) {
+                recordedChunks.push(event.data);
             }
+        };
 
-            emitRecordingError("Video track ended unexpectedly.").catch((error) => {
-                console.warn("Offscreen: Failed to emit track ended error.", error);
+        mediaRecorder.onerror = (event) => {
+            const errorMessage = event.error?.message || "MediaRecorder error";
+            emitRecordingError(errorMessage).catch((error) => {
+                console.warn("Offscreen: Failed to handle recorder error.", error);
             });
         };
-    });
 
-    mediaRecorder.start(100);
-    startTrackMonitor();
+        mediaRecorder.onstop = () => {
+            emitRecordingComplete().catch((error) => {
+                console.warn("Offscreen: Failed to emit recording completion.", error);
+            });
+        };
+
+        mediaStream.getVideoTracks().forEach((track) => {
+            track.onended = () => {
+                if (mediaRecorder?.state === "recording") {
+                    mediaRecorder.stop();
+                    return;
+                }
+
+                emitRecordingError("Video track ended unexpectedly.").catch((error) => {
+                    console.warn("Offscreen: Failed to emit track ended error.", error);
+                });
+            };
+        });
+
+        mediaRecorder.start(100);
+        startTrackMonitor();
+    } catch (error) {
+        cleanupCaptureResources();
+        return { success: false, message: error?.message || "Failed to start MediaRecorder." };
+    }
 
     return {
         success: true,
         mimeType: currentMimeType,
         fileExtension: currentFileExtension,
+        appliedRecordingProfile: resolveRecordingProfile(recordingProfile),
     };
+}
+
+async function startRecording(payload = {}) {
+    const includeAudio = Boolean(payload.includeAudio);
+    const requestedProfile = resolveRecordingProfile(payload.recordingProfile);
+
+    const attempt = async (profile) => startRecordingWithProfile({
+        ...payload,
+        includeAudio,
+    }, profile);
+
+    const firstAttempt = await attempt(requestedProfile);
+    if (firstAttempt.success) {
+        return firstAttempt;
+    }
+
+    const shouldFallbackToDefaultProfile = (
+        (requestedProfile.qualityPreset !== DEFAULT_RECORDING_QUALITY_PRESET || requestedProfile.fpsPreset !== DEFAULT_RECORDING_FPS_PRESET)
+        && isCapabilityError(firstAttempt.message)
+    );
+
+    if (!shouldFallbackToDefaultProfile) {
+        return firstAttempt;
+    }
+
+    const defaultProfile = resolveRecordingProfile();
+    const fallbackAttempt = await attempt(defaultProfile);
+    if (fallbackAttempt.success) {
+        return {
+            ...fallbackAttempt,
+            fallbackNotice: `Requested ${requestedProfile.quality.label} / ${requestedProfile.fps.label} was not supported, so Chrome fell back to ${defaultProfile.quality.label} / ${defaultProfile.fps.label}.`,
+        };
+    }
+
+    return firstAttempt;
 }
 
 async function stopRecording() {

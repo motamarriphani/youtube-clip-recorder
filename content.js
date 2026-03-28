@@ -1,5 +1,35 @@
 console.log("YouTube Clip Recorder: Content script loaded.");
 
+if (typeof globalThis.chrome === "undefined") {
+    globalThis.chrome = {};
+}
+
+if (!globalThis.chrome.runtime) {
+    globalThis.chrome.runtime = {
+        sendMessage: async () => {
+            throw new Error("Extension messaging is unavailable. Refresh the page or reload the extension, then try again.");
+        },
+        onMessage: {
+            addListener: () => {},
+        },
+    };
+}
+
+if (globalThis.chrome?.storage?.sync && typeof globalThis.chrome.storage.sync.get === "function") {
+    const originalSyncGet = globalThis.chrome.storage.sync.get.bind(globalThis.chrome.storage.sync);
+    globalThis.chrome.storage.sync.get = async (...args) => {
+        try {
+            return await originalSyncGet(...args);
+        } catch (error) {
+            const message = String(error?.message || error || "");
+            if (message.includes("Extension context invalidated")) {
+                return {};
+            }
+            throw error;
+        }
+    };
+}
+
 let recordButton = null;
 let recordingStatusChip = null;
 let recordingStatusText = null;
@@ -60,6 +90,25 @@ const DOWNLOAD_FAILED_ERROR_CODE = "download_failed";
 const DOWNLOAD_CANCELLED_ERROR_CODE = "download_cancelled";
 const SAVE_PICKER_UNAVAILABLE_ERROR_CODE = "save_picker_unavailable";
 const NO_AUDIO_EXPORT_FAILED_ERROR_CODE = "no_audio_export_failed";
+const EXPORT_TRANSCODE_FAILED_ERROR_CODE = "export_transcode_failed";
+
+const EXPORT_FPS_OPTIONS = [
+    { value: "source", label: "Source fps" },
+    { value: "30", label: "30 fps" },
+    { value: "60", label: "60 fps" },
+];
+
+const YOUTUBE_QUALITY_DIMENSIONS = {
+    hd2160: { width: 3840, height: 2160, label: "2160p" },
+    hd1440: { width: 2560, height: 1440, label: "1440p" },
+    hd1080: { width: 1920, height: 1080, label: "1080p" },
+    hd720: { width: 1280, height: 720, label: "720p" },
+    large: { width: 854, height: 480, label: "480p" },
+    medium: { width: 640, height: 360, label: "360p" },
+    small: { width: 426, height: 240, label: "240p" },
+    tiny: { width: 256, height: 144, label: "144p" },
+};
+const STANDARD_QUALITY_HEIGHTS = [2160, 1440, 1080, 720, 480, 360, 240, 144];
 
 let recordingTickerId = null;
 let recordingStartedAtMs = 0;
@@ -291,8 +340,24 @@ function isExtensionContextInvalidatedError(error) {
     return message.includes("Extension context invalidated");
 }
 
+function hasRuntimeMessaging() {
+    return typeof chrome !== "undefined"
+        && Boolean(chrome?.runtime)
+        && typeof chrome.runtime.sendMessage === "function";
+}
+
 async function sendRuntimeMessage(message, options = {}) {
     const { recoverOnInvalidation = true } = options;
+
+    if (!hasRuntimeMessaging()) {
+        if (recoverOnInvalidation) {
+            return null;
+        }
+
+        const error = new Error("Extension messaging is unavailable. Refresh the page or reload the extension, then try again.");
+        error.code = "extension_context_unavailable";
+        throw error;
+    }
 
     try {
         return await chrome.runtime.sendMessage(message);
@@ -374,6 +439,9 @@ function toUserErrorMessage({ code, message }) {
     if (code === NO_AUDIO_EXPORT_FAILED_ERROR_CODE) {
         return 'No-audio export failed. Try again or download with audio.';
     }
+    if (code === EXPORT_TRANSCODE_FAILED_ERROR_CODE) {
+        return 'Clip export failed for the selected quality or frame rate. Try Source or a lower setting.';
+    }
     return fallback;
 }
 
@@ -423,6 +491,37 @@ function createPlayerCaptureStream(includeAudio) {
     }
 
     return { sourceStream, recordingStream };
+}
+
+function getPlayerVideoElement() {
+    return document.querySelector('video.html5-main-video');
+}
+
+function pauseUnderlyingPlayerForPreview() {
+    const playerVideo = getPlayerVideoElement();
+    if (!playerVideo) {
+        return;
+    }
+
+    try {
+        if (!playerVideo.paused && !playerVideo.ended) {
+            playerVideo.pause();
+        }
+    } catch (error) {
+        console.debug('YouTube Clip Recorder: Failed to pause underlying player for preview.', error);
+    }
+}
+
+async function getSavedRecorderSettings() {
+    const response = await sendRuntimeMessage({
+        action: 'getRecorderSettings',
+    });
+
+    if (!response || response.success === false) {
+        return null;
+    }
+
+    return response;
 }
 
 function isLocalClipId(clipId) {
@@ -476,14 +575,16 @@ async function hydrateBackgroundPreviewSource(clipId, videoEl) {
             payload: { clipId },
         }, { recoverOnInvalidation: false });
 
-        if (!response?.success || !response.blob || typeof response.blob.size !== 'number') {
+        const previewBlob = normalizePreviewBlob(response?.blob, response?.type)
+            || (response?.dataUrl ? await dataUrlToBlob(response.dataUrl) : null);
+        if (!response?.success || !previewBlob || typeof previewBlob.size !== 'number') {
             return false;
         }
 
         clearBackgroundPreviewCache(clipId);
-        const refreshedPreviewUrl = URL.createObjectURL(response.blob);
+        const refreshedPreviewUrl = URL.createObjectURL(previewBlob);
         backgroundPreviewUrls.set(clipId, refreshedPreviewUrl);
-        setBackgroundPreviewBlob(clipId, response.blob);
+        setBackgroundPreviewBlob(clipId, previewBlob);
         videoEl.src = refreshedPreviewUrl;
         videoEl.load();
         return true;
@@ -509,8 +610,291 @@ function buildNoAudioFilename(filename, preferredExtension = 'webm') {
     return `${normalizedBase}_no-audio.${extension}`;
 }
 
+function getYouTubePlayer() {
+    const player = document.getElementById('movie_player');
+    if (!player) {
+        return null;
+    }
+    return player;
+}
+
+function parseMaybeJson(value) {
+    if (!value) {
+        return null;
+    }
+    if (typeof value === 'object') {
+        return value;
+    }
+    if (typeof value !== 'string') {
+        return null;
+    }
+    try {
+        return JSON.parse(value);
+    } catch (_) {
+        return null;
+    }
+}
+
+function getQualityLevelFromLabel(label) {
+    const normalizedLabel = String(label || '').trim();
+    const matchedEntry = Object.entries(YOUTUBE_QUALITY_DIMENSIONS)
+        .find(([, value]) => value.label === normalizedLabel);
+    if (matchedEntry) {
+        return matchedEntry[0];
+    }
+
+    const matchedHeight = normalizedLabel.match(/(2160|1440|1080|720|480|360|240|144)p/i)?.[1];
+    if (!matchedHeight) {
+        return null;
+    }
+
+    return Object.entries(YOUTUBE_QUALITY_DIMENSIONS)
+        .find(([, value]) => String(value.height) === matchedHeight)?.[0] || null;
+}
+
+function getQualityLevelFromHeight(height) {
+    const numericHeight = Number(height);
+    if (!Number.isFinite(numericHeight)) {
+        return null;
+    }
+    return Object.entries(YOUTUBE_QUALITY_DIMENSIONS)
+        .find(([, value]) => value.height === numericHeight)?.[0] || null;
+}
+
+function normalizeHeightToStandardTier(height) {
+    const numericHeight = Number(height);
+    if (!Number.isFinite(numericHeight) || numericHeight <= 0) {
+        return 720;
+    }
+
+    let bestHeight = STANDARD_QUALITY_HEIGHTS[0];
+    let bestDistance = Math.abs(bestHeight - numericHeight);
+    STANDARD_QUALITY_HEIGHTS.forEach((candidate) => {
+        const distance = Math.abs(candidate - numericHeight);
+        if (distance < bestDistance) {
+            bestHeight = candidate;
+            bestDistance = distance;
+        }
+    });
+    return bestHeight;
+}
+
+function collectQualityLevelsFromStreamingData(targetSet, response) {
+    const parsedResponse = parseMaybeJson(response);
+    const formats = [
+        ...(parsedResponse?.streamingData?.formats || []),
+        ...(parsedResponse?.streamingData?.adaptiveFormats || []),
+    ];
+
+    formats.forEach((format) => {
+        const qualityFromLabel = getQualityLevelFromLabel(format?.qualityLabel || format?.quality);
+        const qualityFromHeight = getQualityLevelFromHeight(format?.height);
+        const matchedLevel = qualityFromLabel || qualityFromHeight;
+        if (matchedLevel) {
+            targetSet.add(matchedLevel);
+        }
+    });
+}
+
+function collectQualityLevelsFromDocumentScripts(targetSet) {
+    const scriptTexts = Array.from(document.scripts || [])
+        .map((script) => script.textContent || '')
+        .filter((text) => text.includes('qualityLabel') || text.includes('streamingData'));
+
+    scriptTexts.forEach((text) => {
+        const qualityLabelMatches = text.match(/"qualityLabel":"(\d{3,4})p/g) || [];
+        qualityLabelMatches.forEach((match) => {
+            const height = Number.parseInt(match.match(/(\d{3,4})p/)?.[1] || '', 10);
+            const level = getQualityLevelFromHeight(height);
+            if (level) {
+                targetSet.add(level);
+            }
+        });
+
+        const heightMatches = text.match(/"height":(\d{3,4})/g) || [];
+        heightMatches.forEach((match) => {
+            const height = Number.parseInt(match.match(/(\d{3,4})/)?.[1] || '', 10);
+            const level = getQualityLevelFromHeight(height);
+            if (level) {
+                targetSet.add(level);
+            }
+        });
+    });
+}
+
+function expandQualityLevelsForExport(targetSet) {
+    const availableHeights = Array.from(targetSet)
+        .map((level) => YOUTUBE_QUALITY_DIMENSIONS[level]?.height || 0)
+        .filter((height) => height > 0);
+
+    if (availableHeights.length === 0) {
+        return;
+    }
+
+    const maxAvailableHeight = Math.max(...availableHeights);
+    Object.entries(YOUTUBE_QUALITY_DIMENSIONS).forEach(([level, value]) => {
+        if (value.height <= maxAvailableHeight) {
+            targetSet.add(level);
+        }
+    });
+}
+
+function addStandardQualityLevelsUpToHeight(targetSet, maxHeight) {
+    const numericMaxHeight = Number(maxHeight);
+    if (!Number.isFinite(numericMaxHeight) || numericMaxHeight <= 0) {
+        return;
+    }
+
+    Object.entries(YOUTUBE_QUALITY_DIMENSIONS).forEach(([level, value]) => {
+        if (value.height <= numericMaxHeight) {
+            targetSet.add(level);
+        }
+    });
+}
+
+function getPlayerQualityOptions() {
+    const player = getYouTubePlayer();
+    const qualityLevels = new Set();
+
+    if (typeof player?.getAvailableQualityLevels === 'function') {
+        player.getAvailableQualityLevels()
+            .filter((level) => YOUTUBE_QUALITY_DIMENSIONS[level])
+            .forEach((level) => qualityLevels.add(level));
+    }
+
+    if (typeof player?.getPlayerResponse === 'function') {
+        collectQualityLevelsFromStreamingData(qualityLevels, player.getPlayerResponse());
+    }
+
+    collectQualityLevelsFromStreamingData(qualityLevels, globalThis?.ytInitialPlayerResponse);
+    collectQualityLevelsFromStreamingData(qualityLevels, globalThis?.ytplayer?.config?.args?.raw_player_response);
+    collectQualityLevelsFromDocumentScripts(qualityLevels);
+
+    const menuLabels = Array.from(document.querySelectorAll('.ytp-quality-menu .ytp-menuitem-label, .ytp-quality-menu .ytp-menuitem'))
+        .map((element) => element.textContent || '')
+        .map((text) => text.match(/(2160|1440|1080|720|480|360|240|144)p/)?.[0] || '')
+        .filter(Boolean);
+    menuLabels.forEach((label) => {
+        const matchedLevel = getQualityLevelFromLabel(label);
+        if (matchedLevel) {
+            qualityLevels.add(matchedLevel);
+        }
+    });
+
+    const detectedHeights = Array.from(qualityLevels)
+        .map((level) => YOUTUBE_QUALITY_DIMENSIONS[level]?.height || 0)
+        .filter((height) => height > 0);
+
+    const video = document.querySelector('video.html5-main-video');
+    const currentVideoHeight = Math.max(144, Number(video?.videoHeight) || 0);
+    const normalizedCurrentHeight = normalizeHeightToStandardTier(currentVideoHeight);
+    const detectedMaxHeight = Math.max(...(detectedHeights.length ? detectedHeights : [0]));
+    const sourceHeight = normalizeHeightToStandardTier(Math.max(detectedMaxHeight, normalizedCurrentHeight, 720));
+
+    const exportLevels = new Set();
+    addStandardQualityLevelsUpToHeight(exportLevels, sourceHeight);
+
+    const options = Array.from(exportLevels)
+        .sort((left, right) => (YOUTUBE_QUALITY_DIMENSIONS[right]?.height || 0) - (YOUTUBE_QUALITY_DIMENSIONS[left]?.height || 0))
+        .map((level) => ({
+            value: level,
+            label: YOUTUBE_QUALITY_DIMENSIONS[level].label,
+        }));
+
+    options.unshift({ value: 'source', label: `Source (${sourceHeight}p)` });
+    return options;
+}
+
+function getTargetExportDimensions(sourceWidth, sourceHeight, qualityValue) {
+    if (!qualityValue || qualityValue === 'source' || !YOUTUBE_QUALITY_DIMENSIONS[qualityValue]) {
+        return {
+            width: sourceWidth,
+            height: sourceHeight,
+        };
+    }
+
+    const maxSize = YOUTUBE_QUALITY_DIMENSIONS[qualityValue];
+    const scale = Math.min(maxSize.width / sourceWidth, maxSize.height / sourceHeight, 1);
+    const scaledWidth = Math.max(2, Math.round(sourceWidth * scale));
+    const scaledHeight = Math.max(2, Math.round(sourceHeight * scale));
+
+    return {
+        width: scaledWidth % 2 === 0 ? scaledWidth : scaledWidth - 1,
+        height: scaledHeight % 2 === 0 ? scaledHeight : scaledHeight - 1,
+    };
+}
+
+function getTargetExportFrameRate(sourceFpsEstimate, fpsValue) {
+    if (!fpsValue || fpsValue === 'source') {
+        return sourceFpsEstimate;
+    }
+
+    const parsedValue = Number.parseInt(fpsValue, 10);
+    if (!Number.isFinite(parsedValue) || parsedValue <= 0) {
+        return sourceFpsEstimate;
+    }
+
+    if (!Number.isFinite(sourceFpsEstimate) || sourceFpsEstimate <= 0) {
+        return parsedValue;
+    }
+
+    return Math.min(parsedValue, sourceFpsEstimate);
+}
+
+function buildExportFilename(filename, qualityValue, fpsValue, includeAudio, extension) {
+    const safeName = String(filename || 'youtube_clip.webm');
+    const baseName = safeName.replace(/\.[^/.]+$/, '').replace(/_with-audio$/i, '');
+    const qualitySuffix = qualityValue && qualityValue !== 'source'
+        ? `_${YOUTUBE_QUALITY_DIMENSIONS[qualityValue]?.label || qualityValue}`
+        : '';
+    const fpsSuffix = fpsValue && fpsValue !== 'source'
+        ? `_${fpsValue}fps`
+        : '';
+    const audioSuffix = includeAudio ? '' : '_no-audio';
+    return `${baseName}${qualitySuffix}${fpsSuffix}${audioSuffix}.${extension}`;
+}
+
+function triggerLocalBlobDownload({ blob, filename }) {
+    if (!blob || typeof blob.size !== 'number') {
+        const error = new Error('Missing blob payload for download.');
+        error.code = DOWNLOAD_FAILED_ERROR_CODE;
+        throw error;
+    }
+
+    const downloadUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = downloadUrl;
+    link.download = filename || 'youtube_clip.webm';
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(downloadUrl), 30000);
+}
+
 function getLocalClipEntry(clipId) {
     return localPendingClips.get(clipId) || null;
+}
+
+function normalizePreviewBlob(blobLike, type = 'video/webm') {
+    if (blobLike instanceof Blob) {
+        return blobLike;
+    }
+
+    if (blobLike instanceof ArrayBuffer) {
+        return new Blob([blobLike], { type });
+    }
+
+    if (ArrayBuffer.isView(blobLike)) {
+        return new Blob([blobLike.buffer], { type });
+    }
+
+    return null;
+}
+
+async function dataUrlToBlob(dataUrl) {
+    const response = await fetch(dataUrl);
+    return response.blob();
 }
 
 async function getBackgroundClipBlob(clipId) {
@@ -524,14 +908,19 @@ async function getBackgroundClipBlob(clipId) {
         payload: { clipId },
     }, { recoverOnInvalidation: false });
 
-    if (!response?.success || !response.blob || typeof response.blob.size !== 'number') {
+        const fetchedBlob = response?.dataUrl ? await dataUrlToBlob(response.dataUrl) : null;
+        const normalizedBlob = normalizePreviewBlob(response?.blob, response?.type)
+            || normalizePreviewBlob(response?.buffer, response?.type)
+            || fetchedBlob;
+
+    if (!response?.success || !normalizedBlob || typeof normalizedBlob.size !== 'number') {
         const error = new Error(response?.message || 'Clip data is no longer available.');
         error.code = response?.code || null;
         throw error;
     }
 
-    setBackgroundPreviewBlob(clipId, response.blob);
-    return response.blob;
+    setBackgroundPreviewBlob(clipId, normalizedBlob);
+    return normalizedBlob;
 }
 
 async function getClipBlobForExport(clipId) {
@@ -583,6 +972,157 @@ function stopStreamTracks(stream) {
             track.stop();
         }
     });
+}
+
+async function createExportBlobFromSource(sourceBlob, exportOptions = {}) {
+    if (!sourceBlob || typeof sourceBlob.size !== 'number') {
+        throw new Error('Source clip is not available for export.');
+    }
+
+    const {
+        includeAudio = true,
+        quality = 'source',
+        fps = 'source',
+    } = exportOptions;
+
+    const sourceUrl = URL.createObjectURL(sourceBlob);
+    const hiddenVideo = document.createElement('video');
+    hiddenVideo.muted = true;
+    hiddenVideo.defaultMuted = true;
+    hiddenVideo.volume = 0;
+    hiddenVideo.preload = 'auto';
+    hiddenVideo.playsInline = true;
+    hiddenVideo.src = sourceUrl;
+    hiddenVideo.style.position = 'fixed';
+    hiddenVideo.style.left = '-9999px';
+    hiddenVideo.style.top = '-9999px';
+    hiddenVideo.style.width = '1px';
+    hiddenVideo.style.height = '1px';
+    hiddenVideo.style.opacity = '0';
+    document.body.appendChild(hiddenVideo);
+
+    const canvas = document.createElement('canvas');
+    canvas.style.position = 'fixed';
+    canvas.style.left = '-9999px';
+    canvas.style.top = '-9999px';
+    canvas.style.opacity = '0';
+    document.body.appendChild(canvas);
+
+    let canvasStream = null;
+    let sourcePlaybackStream = null;
+    let composedStream = null;
+    let recorder = null;
+    let animationFrameId = null;
+    let stopPromise = null;
+
+    const cleanup = () => {
+        if (animationFrameId) {
+            cancelAnimationFrame(animationFrameId);
+            animationFrameId = null;
+        }
+        hiddenVideo.pause();
+        stopStreamTracks(canvasStream);
+        stopStreamTracks(sourcePlaybackStream);
+        stopStreamTracks(composedStream);
+        if (hiddenVideo.parentNode) {
+            hiddenVideo.remove();
+        }
+        if (canvas.parentNode) {
+            canvas.remove();
+        }
+        URL.revokeObjectURL(sourceUrl);
+    };
+
+    try {
+        await waitForMediaEvent(hiddenVideo, 'loadedmetadata', 15000);
+        if (hiddenVideo.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) {
+            await waitForMediaEvent(hiddenVideo, 'canplay', 15000);
+        }
+
+        const sourceWidth = Math.max(2, Number(hiddenVideo.videoWidth) || 1280);
+        const sourceHeight = Math.max(2, Number(hiddenVideo.videoHeight) || 720);
+        const targetSize = getTargetExportDimensions(sourceWidth, sourceHeight, quality);
+        const sourceFpsEstimate = Number(getYouTubePlayer()?.getVideoData?.().fps) || 60;
+        const targetFps = getTargetExportFrameRate(sourceFpsEstimate, fps);
+
+        canvas.width = targetSize.width;
+        canvas.height = targetSize.height;
+
+        const context = canvas.getContext('2d', { alpha: false });
+        if (!context) {
+            throw new Error('Canvas export context is unavailable.');
+        }
+
+        const drawFrame = () => {
+            if (hiddenVideo.ended || hiddenVideo.paused) {
+                return;
+            }
+            context.drawImage(hiddenVideo, 0, 0, canvas.width, canvas.height);
+            animationFrameId = requestAnimationFrame(drawFrame);
+        };
+
+        canvasStream = canvas.captureStream(targetFps || 30);
+        sourcePlaybackStream = typeof hiddenVideo.captureStream === 'function'
+            ? hiddenVideo.captureStream()
+            : (typeof hiddenVideo.mozCaptureStream === 'function' ? hiddenVideo.mozCaptureStream() : null);
+
+        const composedTracks = [...canvasStream.getVideoTracks()];
+        if (includeAudio) {
+            const audioTrack = sourcePlaybackStream?.getAudioTracks?.()[0];
+            if (audioTrack) {
+                composedTracks.push(audioTrack);
+            }
+        }
+        composedStream = new MediaStream(composedTracks);
+
+        const selectedMime = selectSupportedMimeType(includeAudio);
+        const recorderOptions = selectedMime.type ? { mimeType: selectedMime.type } : undefined;
+        const chunks = [];
+
+        stopPromise = new Promise((resolve, reject) => {
+            recorder = recorderOptions
+                ? new MediaRecorder(composedStream, recorderOptions)
+                : new MediaRecorder(composedStream);
+
+            recorder.ondataavailable = (event) => {
+                if (event.data && event.data.size > 0) {
+                    chunks.push(event.data);
+                }
+            };
+
+            recorder.onerror = (event) => {
+                reject(event.error || new Error('MediaRecorder export failed.'));
+            };
+
+            recorder.onstop = () => {
+                const blob = new Blob(chunks, { type: selectedMime.type || 'video/webm' });
+                resolve({
+                    blob,
+                    extension: selectedMime.extension || 'webm',
+                });
+            };
+        });
+
+        recorder.start(100);
+        context.drawImage(hiddenVideo, 0, 0, canvas.width, canvas.height);
+        animationFrameId = requestAnimationFrame(drawFrame);
+        await hiddenVideo.play();
+        await waitForMediaEvent(hiddenVideo, 'ended', 60000);
+        if (recorder.state !== 'inactive') {
+            recorder.stop();
+        }
+
+        return await stopPromise;
+    } catch (error) {
+        if (recorder?.state && recorder.state !== 'inactive') {
+            recorder.stop();
+        }
+        const exportError = new Error(error?.message || 'Failed to export clip.');
+        exportError.code = EXPORT_TRANSCODE_FAILED_ERROR_CODE;
+        throw exportError;
+    } finally {
+        cleanup();
+    }
 }
 
 async function createNoAudioBlobFromSource(sourceBlob) {
@@ -1212,6 +1752,7 @@ async function handleRecordButtonClick() {
 
 function showPreviewModal({ clipId, url, filename, blob }) {
     discardPreviewLocally();
+    pauseUnderlyingPlayerForPreview();
     activePreviewClipId = clipId;
     const previewUrl = resolvePreviewUrl({ clipId, url, blob });
 
@@ -1253,6 +1794,20 @@ function showPreviewModal({ clipId, url, filename, blob }) {
     const modalEl = overlay.querySelector('.yt-clip-preview-modal');
     const statusEl = overlay.querySelector('.yt-clip-preview-status');
     const downloadAudioCheckbox = overlay.querySelector('.yt-clip-download-audio-checkbox');
+    const exportOptionsContainer = document.createElement('div');
+    exportOptionsContainer.className = 'yt-clip-export-options';
+    exportOptionsContainer.innerHTML = `
+        <label class="yt-clip-export-field">
+            <span>Quality</span>
+            <select class="yt-clip-export-quality"></select>
+        </label>
+        <label class="yt-clip-export-field">
+            <span>Frame rate</span>
+            <select class="yt-clip-export-fps"></select>
+        </label>
+    `;
+    const exportQualitySelect = exportOptionsContainer.querySelector('.yt-clip-export-quality');
+    const exportFpsSelect = exportOptionsContainer.querySelector('.yt-clip-export-fps');
     const minimizeButton = overlay.querySelector('.yt-clip-preview-minimize');
     const closeButton = overlay.querySelector('.yt-clip-preview-close');
     const saveButton = overlay.querySelector('.yt-clip-save');
@@ -1269,12 +1824,21 @@ function showPreviewModal({ clipId, url, filename, blob }) {
         discardButton,
         replayButton,
         retryPreviewButton,
-        closeButton,
-        minimizeButton,
         discardConfirmYesButton,
         discardConfirmCancelButton,
     ].filter(Boolean);
     let isBusy = false;
+
+    const qualityOptions = getPlayerQualityOptions();
+    exportQualitySelect.innerHTML = qualityOptions
+        .map((option) => `<option value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</option>`)
+        .join('');
+    exportFpsSelect.innerHTML = EXPORT_FPS_OPTIONS
+        .map((option) => `<option value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</option>`)
+        .join('');
+
+    const filenameElement = overlay.querySelector('.yt-clip-preview-filename');
+    filenameElement?.insertAdjacentElement('afterend', exportOptionsContainer);
 
     const setPreviewStatus = (statusText = '', type = 'info') => {
         if (!statusEl) return;
@@ -1298,6 +1862,12 @@ function showPreviewModal({ clipId, url, filename, blob }) {
         });
         if (downloadAudioCheckbox) {
             downloadAudioCheckbox.disabled = busy;
+        }
+        if (exportQualitySelect) {
+            exportQualitySelect.disabled = busy;
+        }
+        if (exportFpsSelect) {
+            exportFpsSelect.disabled = busy;
         }
         if (typeof statusText === 'string') {
             setPreviewStatus(statusText, statusType);
@@ -1385,9 +1955,12 @@ function showPreviewModal({ clipId, url, filename, blob }) {
         if (isBusy || !activePreviewClipId) return;
         const currentClipId = activePreviewClipId;
         const withAudio = downloadAudioCheckbox ? downloadAudioCheckbox.checked : true;
+        const selectedQuality = exportQualitySelect ? exportQualitySelect.value : 'source';
+        const selectedFps = exportFpsSelect ? exportFpsSelect.value : 'source';
+        const needsTranscode = !withAudio || selectedQuality !== 'source' || selectedFps !== 'source';
         setDiscardConfirmationVisible(false);
 
-        if (withAudio) {
+        if (!needsTranscode && withAudio) {
             setPreviewBusy(true, saveAs ? 'Preparing Save As download...' : 'Preparing download...', 'info');
             try {
                 if (saveAs) {
@@ -1398,24 +1971,20 @@ function showPreviewModal({ clipId, url, filename, blob }) {
                     });
 
                     if (isLocalClipId(currentClipId)) {
-                        discardLocalClip(currentClipId);
-                    } else {
-                        const discardResponse = await sendRuntimeMessage({
-                            action: "discardClip",
-                            payload: { clipId: currentClipId },
-                        }, { recoverOnInvalidation: false });
-                        if (discardResponse?.success === false) {
-                            console.warn('YouTube Clip Recorder: Failed to discard saved background clip after Save As.');
-                        }
+                        setPreviewBusy(false);
+                        setPreviewStatus('Export saved. You can save another version or discard when done.', 'success');
+                        return;
                     }
 
-                    discardPreviewLocally();
+                    setPreviewBusy(false);
+                    setPreviewStatus('Export saved. You can save another version or discard when done.', 'success');
                     return;
                 }
 
                 if (isLocalClipId(currentClipId)) {
                     await saveLocalClip(currentClipId, saveAs);
-                    discardPreviewLocally();
+                    setPreviewBusy(false);
+                    setPreviewStatus('Export saved. You can save another version or discard when done.', 'success');
                     return;
                 }
 
@@ -1428,7 +1997,8 @@ function showPreviewModal({ clipId, url, filename, blob }) {
                     error.code = response?.code || DOWNLOAD_FAILED_ERROR_CODE;
                     throw error;
                 }
-                discardPreviewLocally();
+                setPreviewBusy(false);
+                setPreviewStatus('Export started. You can save another version or discard when done.', 'success');
             } catch (error) {
                 const details = extractErrorDetails(error);
                 if (details.code === DOWNLOAD_CANCELLED_ERROR_CODE) {
@@ -1444,38 +2014,36 @@ function showPreviewModal({ clipId, url, filename, blob }) {
             return;
         }
 
-        setPreviewBusy(true, 'Removing audio and preparing download...', 'info');
+        setPreviewBusy(true, saveAs ? 'Preparing exported clip...' : 'Preparing exported download...', 'info');
         try {
             const sourceBlob = await getClipBlobForExport(currentClipId);
-            const noAudioResult = await createNoAudioBlobFromSource(sourceBlob);
-            const noAudioFilename = buildNoAudioFilename(filename, noAudioResult.extension);
+            const exportResult = await createExportBlobFromSource(sourceBlob, {
+                includeAudio: withAudio,
+                quality: selectedQuality,
+                fps: selectedFps,
+            });
+            const exportFilename = buildExportFilename(
+                filename,
+                selectedQuality,
+                selectedFps,
+                withAudio,
+                exportResult.extension
+            );
 
             if (saveAs) {
                 await saveBlobWithSystemPicker({
-                    blob: noAudioResult.blob,
-                    filename: noAudioFilename,
+                    blob: exportResult.blob,
+                    filename: exportFilename,
                 });
             } else {
-                await requestBlobDownload({
-                    blob: noAudioResult.blob,
-                    filename: noAudioFilename,
-                    saveAs: false,
+                triggerLocalBlobDownload({
+                    blob: exportResult.blob,
+                    filename: exportFilename,
                 });
             }
 
-            if (isLocalClipId(currentClipId)) {
-                discardLocalClip(currentClipId);
-            } else {
-                const response = await sendRuntimeMessage({
-                    action: "discardClip",
-                    payload: { clipId: currentClipId },
-                }, { recoverOnInvalidation: false });
-                if (response?.success === false) {
-                    console.warn('YouTube Clip Recorder: Failed to discard original background clip after no-audio export.');
-                }
-            }
-
-            discardPreviewLocally();
+            setPreviewBusy(false);
+            setPreviewStatus('Export ready. You can save more versions or discard when done.', 'success');
         } catch (error) {
             const details = extractErrorDetails(error);
             if (details.code === DOWNLOAD_CANCELLED_ERROR_CODE) {
@@ -1484,9 +2052,9 @@ function showPreviewModal({ clipId, url, filename, blob }) {
                 setPreviewStatus(toUserErrorMessage(details), 'warning');
                 return;
             }
-            console.error('YouTube Clip Recorder: Failed to export no-audio clip.', error);
+            console.error('YouTube Clip Recorder: Failed to export clip.', error);
             setPreviewBusy(false);
-            setPreviewStatus(`No-audio export failed: ${toUserErrorMessage(details)}`, 'error');
+            setPreviewStatus(`Export failed: ${toUserErrorMessage(details)}`, 'error');
         }
     };
 
@@ -1701,36 +2269,38 @@ function handleUnsavedPreviewBeforeUnload(event) {
     return PREVIEW_UNSAVED_GUARD_MESSAGE;
 }
 
-chrome.runtime.onMessage.addListener((message) => {
-    if (!message) return;
+if (typeof chrome !== "undefined" && chrome?.runtime?.onMessage) {
+    chrome.runtime.onMessage.addListener((message) => {
+        if (!message) return;
 
-    if (message.action === 'clipReadyForPreview') {
-        showPreviewModal(message.payload);
-        return;
-    }
-
-    if (message.type === RECORDING_STARTED_EVENT) {
-        if (!isRecording) {
-            activeRecordingMode = BACKGROUND_RECORDING_MODE;
-            applyRecordingState();
-        }
-    } else if (message.type === RECORDING_STOPPED_EVENT) {
-        const stopReason = message.payload?.reason || '';
-        if (
-            stopReason === RECORDING_STOP_REASON_RECORDER_ERROR
-            || stopReason === RECORDING_STOP_REASON_START_FAILED
-            || stopReason === RECORDING_STOP_REASON_FINALIZE_FAILED
-        ) {
+        if (message.action === 'clipReadyForPreview') {
+            showPreviewModal(message.payload);
             return;
         }
-        resetUIState();
-    } else if (message.type === RECORDING_ERROR_EVENT) {
-        const details = extractErrorDetails(message.payload || {});
-        console.error('YouTube Clip Recorder: Background recording error.', details.message);
-        resetRuntimeUiFlags();
-        showRecorderInlineError(toUserErrorMessage(details));
-    }
-});
+
+        if (message.type === RECORDING_STARTED_EVENT) {
+            if (!isRecording) {
+                activeRecordingMode = BACKGROUND_RECORDING_MODE;
+                applyRecordingState();
+            }
+        } else if (message.type === RECORDING_STOPPED_EVENT) {
+            const stopReason = message.payload?.reason || '';
+            if (
+                stopReason === RECORDING_STOP_REASON_RECORDER_ERROR
+                || stopReason === RECORDING_STOP_REASON_START_FAILED
+                || stopReason === RECORDING_STOP_REASON_FINALIZE_FAILED
+            ) {
+                return;
+            }
+            resetUIState();
+        } else if (message.type === RECORDING_ERROR_EVENT) {
+            const details = extractErrorDetails(message.payload || {});
+            console.error('YouTube Clip Recorder: Background recording error.', details.message);
+            resetRuntimeUiFlags();
+            showRecorderInlineError(toUserErrorMessage(details));
+        }
+    });
+}
 
 window.addEventListener('beforeunload', handleUnsavedPreviewBeforeUnload);
 window.addEventListener('pagehide', cleanupPreviewOnUnload);
@@ -1874,6 +2444,29 @@ function bootstrap() {
     handleRouteOrStateChange();
     ensureRecorderControlsInjected();
     debouncedInitialize();
+}
+
+async function getMaxRecordDurationMs() {
+    const savedSettings = await getSavedRecorderSettings();
+    if (savedSettings?.maxRecordDurationSeconds) {
+        return clampDurationSeconds(savedSettings.maxRecordDurationSeconds) * 1000;
+    }
+
+    try {
+        if (
+            typeof chrome === 'undefined'
+            || !chrome?.storage?.sync
+            || typeof chrome.storage.sync.get !== 'function'
+        ) {
+            return DEFAULT_MAX_RECORD_DURATION_MS;
+        }
+
+        const settings = await chrome.storage.sync.get(STORAGE_KEY_MAX_DURATION_SECONDS);
+        const seconds = clampDurationSeconds(settings?.[STORAGE_KEY_MAX_DURATION_SECONDS]);
+        return seconds * 1000;
+    } catch (error) {
+        return DEFAULT_MAX_RECORD_DURATION_MS;
+    }
 }
 
 bootstrap();
